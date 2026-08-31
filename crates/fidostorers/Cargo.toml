@@ -1,0 +1,25 @@
+[package]
+name = "fidostorers"
+description = "Encrypt files, directories, and key/value secrets using a FIDO2 security key."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "fidostorers"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fidostorers"
+path = "src/bin/fidostorers.rs"
+
+[dependencies]
+fido-token.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+rand.workspace = true

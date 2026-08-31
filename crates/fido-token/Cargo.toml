@@ -1,0 +1,33 @@
+[package]
+name = "fido-token"
+description = "Talk to FIDO2/U2F security keys and derive stable secrets from the hmac-secret CTAP2 extension."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "fido_token"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fido-token"
+path = "src/bin/fido-token.rs"
+
+[features]
+# Exposes `fake::FakeAuthenticator`, a pure-software `Authenticator` impl used by
+# this crate's own tests and reusable by downstream crates (e.g. fidostorers) so
+# their tests don't need physical hardware either. See plan/05-testing-strategy.md.
+test-util = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+rand.workspace = true
+hmac.workspace = true
+sha2.workspace = true
