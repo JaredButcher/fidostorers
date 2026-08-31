@@ -20,6 +20,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 #[derive(Parser)]
 #[command(
     name = "fidostorers",
+    version,
     about = "Encrypt files, directories, and key/value secrets using a FIDO2 security key"
 )]
 struct Cli {
@@ -252,6 +253,24 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn version_flags_report_the_crate_version() {
+        for flag in ["--version", "-V"] {
+            // `unwrap_err` would require `Cli: Debug`; match instead so the
+            // production type keeps its current derives.
+            let err = match Cli::try_parse_from(["fidostorers", flag]) {
+                Ok(_) => panic!("{flag} should short-circuit parsing, not produce a command"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+            assert!(
+                err.to_string().contains(env!("CARGO_PKG_VERSION")),
+                "{flag} output {:?} should contain the crate version",
+                err.to_string()
+            );
+        }
     }
 
     #[test]
