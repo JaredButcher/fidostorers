@@ -5,8 +5,9 @@ for. It owns the "vault" concept, the archive/file/kv modes, and the CLI UX.
 
 ## Concepts
 
-- **Vault**: one file on disk (default extension `.fido` — bikeshed-able, see
-  [07-open-decisions.md](07-open-decisions.md)) holding a header (enrolled
+- **Vault**: one file on disk (extension `.fido`, settled in
+  [07-open-decisions.md](07-open-decisions.md) #3; the magic bytes remain `FSTR`)
+  holding a header (enrolled
   credentials + wrapped data key + mode metadata) and a ciphertext payload. Format
   detail in [03-vault-format-and-crypto.md](03-vault-format-and-crypto.md).
 - **Enrollment**: a vault can have 1..N enrolled security keys. Any one of them can
@@ -50,7 +51,8 @@ fidostorers kv ls <vault>
 fidostorers info <vault>
     Show mode, enrolled credential count/labels, format version — no touch required
     (header is not secret, only the wrapped keys within it, which reveal nothing
-    without the security key).
+    without the security key). Output is UNAUTHENTICATED: header_mac can only be
+    checked with the data key, which needs a touch. Marked as such in the output.
 ```
 
 Every unlocking operation (`unlock`, `kv get/set/rm/ls`, `enroll`, `revoke`) needs a
@@ -82,7 +84,7 @@ impl Vault {
     pub fn credentials(&self) -> &[fido_token::Credential];
     pub fn unlock_with(&self, credential_id: &[u8], kek: Zeroizing<[u8;32]>) -> Result<Zeroizing<[u8;32]>, VaultError>; // -> data key
     pub fn enroll(&mut self, data_key: &Zeroizing<[u8;32]>, new_cred: &fido_token::Credential, new_kek: Zeroizing<[u8;32]>) -> Result<(), VaultError>;
-    pub fn revoke(&mut self, credential_id: &[u8]) -> Result<(), VaultError>;
+    pub fn revoke(&mut self, data_key: &Zeroizing<[u8;32]>, credential_id: &[u8]) -> Result<(), VaultError>;
 
     pub fn seal_file(&self, data_key: &Zeroizing<[u8;32]>, input: &Path) -> Result<(), VaultError>;
     pub fn open_file(&self, data_key: &Zeroizing<[u8;32]>, output: &Path) -> Result<(), VaultError>;
@@ -95,6 +97,11 @@ impl Vault {
     pub fn kv_ls(&self, data_key: &Zeroizing<[u8;32]>) -> Result<Vec<String>, VaultError>;
 }
 ```
+
+`revoke` takes the data key because removing an entry changes the header, and the
+header's `header_mac` must be recomputed under a key derived from the data key (see
+[03-vault-format-and-crypto.md](03-vault-format-and-crypto.md)). The caller already
+holds it: revoking requires unlocking with a surviving credential first.
 
 Note the split: `unlock_with` takes an already-derived KEK (crate 2 never imports
 `fido-token`'s HID internals into `Vault` itself — the CLI binary orchestrates "call

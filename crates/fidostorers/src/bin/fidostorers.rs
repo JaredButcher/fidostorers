@@ -154,8 +154,13 @@ fn run() -> Result<()> {
         }
         Commands::Revoke { vault, credential } => {
             let credential_id = from_hex(&credential).context("--credential must be hex")?;
-            let mut vault = Vault::open(&vault)?;
-            vault.revoke(&credential_id)?;
+            let vault = Vault::open(&vault)?;
+            // Revoking rewrites the header, so `header_mac` has to be recomputed under
+            // a key derived from the data key (plan/03-vault-format-and-crypto.md).
+            // That means unlocking with a surviving credential first; wiring up that
+            // touch is M5, same as enrollment.
+            let _ = (&vault, &credential_id);
+            bail!("revocation lands in M5, see plan/06-roadmap.md");
         }
         Commands::Lock { vault, input } => {
             let vault = Vault::open(&vault)?;

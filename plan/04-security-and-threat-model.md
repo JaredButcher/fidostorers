@@ -52,11 +52,28 @@ audit. Revisit before any real-world sensitive use.
 
 ## Downgrade/tampering resistance
 
-- Header is authenticated (AAD, see [03-vault-format-and-crypto.md](03-vault-format-and-crypto.md)) so an attacker who can write to the vault file cannot silently
-  strip a credential's wrapped entry, swap salts, or change `mode` without every
-  subsequent unlock failing an AEAD tag check rather than silently misbehaving.
+- Tampering with a field that feeds key derivation — a `salt` (including swapping two
+  entries' salts), a `credential_id`, either nonce, or `payload_len` — is caught by
+  the AEAD tag alone, because the wrong key or keystream is produced. No associated
+  data is needed for this and none is used; see
+  [03-vault-format-and-crypto.md](03-vault-format-and-crypto.md).
+- The three things that would *not* be caught that way — silently deleting a
+  credential's entry, relabelling one, and flipping `mode` — are covered by
+  `header_mac`, an HMAC over the whole header under a key derived from the data key.
+  It is verified on every unlock, immediately after the data key is unwrapped and
+  before `mode` or any label is acted on.
+- **`fidostorers info` output is unauthenticated.** Verifying `header_mac` requires
+  the data key, which requires a touch; `info` deliberately requires no touch. Its
+  output must be labelled as unverified, and nothing security-relevant should be
+  decided from it. Every path that *acts* on header contents requires a touch and
+  therefore verifies the MAC first.
+- An attacker cannot add a working credential entry: forging a wrapped data key
+  requires the data key itself.
 - `format_version` is checked on open; unknown versions are a hard error, not a
   best-effort parse, to avoid ever silently misinterpreting a header.
+- Header length prefixes are read before `header_mac` can be verified, so they are
+  bounds-checked at parse time. A hostile length field must fail cleanly rather than
+  drive a huge allocation.
 
 ## Explicitly deferred (v2+ or "won't do")
 

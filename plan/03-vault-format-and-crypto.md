@@ -4,11 +4,15 @@
 
 ```
 security key #1 ──(hmac-secret, salt_1)──► secret_1 (32B) ──HKDF──► KEK_1 ──unwrap──┐
-security key #2 ──(hmac-secret, salt_2)──► secret_2 (32B) ──HKDF──► KEK_2 ──unwrap──┼──► data key (32B, random, generated once at `init`)
-security key #N ──(hmac-secret, salt_N)──► secret_N (32B) ──HKDF──► KEK_N ──unwrap──┘
-                                                                                       │
-                                                                                       ▼
-                                                                    AEAD(data key) seals/opens the payload
+security key #2 ──(hmac-secret, salt_2)──► secret_2 (32B) ──HKDF──► KEK_2 ──unwrap──┼──► data key
+security key #N ──(hmac-secret, salt_N)──► secret_N (32B) ──HKDF──► KEK_N ──unwrap──┘   (32B, random,
+                                                                                         once at `init`)
+                                    ┌────────────────────────────────────────────────────────┘
+                                    │
+              ┌─────────────────────┴─────────────────────┐
+              ▼                                           ▼
+   AEAD(data key) seals/opens             HKDF ──► mac key ──► header_mac
+   the payload                                       authenticates the header
 ```
 
 - **`data key`**: 32 random bytes, generated once with `OsRng` when the vault is
@@ -24,9 +28,56 @@ security key #N ──(hmac-secret, salt_N)──► secret_N (32B) ──HKDF�
 - **`KEK_i`**: `HKDF-SHA256(ikm = secret_i, salt = None, info = b"fidostorers-kek-v1")`.
   The HKDF step exists so the AEAD key is clearly domain-separated from the raw
   `hmac-secret` output, in case that output is ever reused for anything else.
-- **Wrapped data key**: `AEAD_Encrypt(key = KEK_i, nonce = wrap_nonce_i, plaintext = data key, aad = header-without-wrapped-keys)`.
-  Binding the AAD to the rest of the header prevents mix-and-match tampering (e.g.
-  swapping which mode a wrapped key claims to belong to).
+- **Wrapped data key**: `AEAD_Encrypt(key = KEK_i, nonce = wrap_nonce_i, plaintext = data key)`.
+  No associated data — see "Header authentication" below for why AAD is not used
+  anywhere in this format.
+- **`mac key`**: `HKDF-SHA256(ikm = data key, salt = None, info = b"fidostorers-header-mac-v1")`.
+  Domain-separated from the payload AEAD key so the data key is never used directly
+  for two different primitives.
+- **`header_mac`**: `HMAC-SHA256(mac key, all header bytes preceding this field)`.
+
+## Header authentication
+
+This format uses **no AAD**. Every AEAD call passes empty associated data, and header
+integrity is provided by the single `header_mac` field instead.
+
+The reason is that most of the header is already self-authenticating, because the
+fields an attacker would want to tamper with are *inputs to the key derivation*:
+
+| Tampered field | What catches it |
+|---|---|
+| `magic`, `format_version` | parser rejects before any crypto runs |
+| `rp_id` | credential IDs are rp-bound blobs; the authenticator rejects the assertion |
+| `credential_id` | device rejects it, or derives a different `credRandom` → wrong KEK |
+| `salt` (including swapping two entries' salts) | wrong KEK → wrap tag fails |
+| `wrap_nonce` | wrong keystream → wrap tag fails |
+| `payload_nonce` | feeds the Poly1305 one-time key → payload tag fails |
+| `payload_len` | truncates the ciphertext / reads past EOF → payload tag fails |
+| payload ciphertext | payload tag fails |
+| an entry the attacker *adds* | they cannot forge a wrap without the data key |
+
+That leaves exactly three things an AEAD tag would not catch on its own: **deleting a
+credential entry**, **relabelling one**, and **flipping `mode`**. `header_mac` covers
+all three, in one place, for 32 bytes.
+
+Using a MAC rather than AAD also keeps `enroll`/`revoke` cheap. Had the header been
+the AAD for the per-credential wraps, changing the credential table would invalidate
+*every* entry's wrap, and re-wrapping entry `B` requires `KEK_B` — which requires
+physically touching key B. Revoking a lost key while holding the primary would
+silently brick the backup key sitting in a safe, discovered only in the emergency
+that backup exists for. A MAC under the data key has no such problem: `enroll` and
+`revoke` both already hold the data key, so both can recompute `header_mac` without
+touching any other credential's device.
+
+**Verification order** on unlock: parse header (enforcing the size caps below) →
+unwrap the data key with the chosen credential's KEK → derive the mac key → verify
+`header_mac` → only then act on `mode`, labels, or the payload. Using the data key
+solely to check a MAC before the header is trusted emits no plaintext and dispatches
+on nothing, so the ordering is safe.
+
+**Caveat**: `header_mac` cannot be checked without the data key, so `fidostorers info`
+(which deliberately requires no touch) displays *unauthenticated* header data. Its
+output must be labelled as such — see [04-security-and-threat-model.md](04-security-and-threat-model.md).
 
 ## On-disk layout
 
@@ -46,21 +97,28 @@ security key #N ──(hmac-secret, salt_N)──► secret_N (32B) ──HKDF�
 │ ── end repeated ──                                          │
 │ payload_nonce: [u8; 24]                                     │
 │ payload_len: u64                                            │
+│ header_mac: [u8; 32]   (HMAC-SHA256 over all of the above)  │
 │ payload_ciphertext: [payload_len + 16 bytes]                │
 └──────────────────────────────────────────────────────────┘
 ```
 
-Everything above the payload is the "header"; it is **not encrypted** (there is
-nothing secret in it — credential IDs and salts are meaningless without the physical
-authenticator, per the `hmac-secret` security model) but *is* authenticated: it forms
-the AAD for both the per-credential key-wrap AEAD calls and the payload AEAD call, so
-no byte of it can be modified without every unlock failing loudly.
+Everything above `payload_ciphertext` is the "header". It is **not encrypted** (there
+is nothing secret in it — credential IDs and salts are meaningless without the
+physical authenticator, per the `hmac-secret` security model) but is authenticated by
+`header_mac`.
 
-Exact byte-level framing (fixed-width vs. varint length prefixes, whether we use a
-hand-rolled encoder or `postcard`/`bincode` over a `#[derive(Serialize)]` struct) is
-an implementation detail to nail down in [07-open-decisions.md](07-open-decisions.md);
-the field list and its authentication properties are the load-bearing part of this
-doc.
+Serialization is `postcard` over `serde`-derived structs
+([07-open-decisions.md](07-open-decisions.md) #5). Because `header_mac` is computed
+over the literal bytes written to disk and verified over the literal byte range read
+back, the header is never re-serialized for authentication purposes — so postcard's
+cross-version encoding stability is an ordinary compatibility concern governed by
+`format_version`, not a security property.
+
+**Parse-time size caps are mandatory.** Length prefixes are read from an
+unauthenticated file and `header_mac` cannot be verified until after the data key is
+recovered, so `credential_count`, `rp_id`'s length, and every length-prefixed byte
+string must be bounds-checked *before* allocating. A corrupt or hostile 8-byte length
+must not be able to drive a multi-gigabyte allocation.
 
 ## Payload encoding per mode
 
@@ -68,10 +126,13 @@ doc.
 - **`dir`**: `payload_ciphertext` decrypts to a `tar` stream (via the `tar` crate) of
   the directory tree, built with deterministic entry order (sorted paths) so repeated
   `lock` of unchanged input is reproducible — useful for tests and for eyeballing
-  diffs of re-encrypted vaults during development. Symlinks: stored as symlinks in the
-  tar entry (not followed), consistent with GNU tar defaults; permissions preserved
-  best-effort per-platform (Windows tar semantics differ — flagged in
-  [07-open-decisions.md](07-open-decisions.md)).
+  diffs of re-encrypted vaults during development. Symlinks are stored as tar symlink
+  entries (never followed) and Unix mode bits are stored as-is, on every OS, so the
+  archive is always full-fidelity. Extraction is best-effort per platform: on Windows,
+  a symlink that cannot be created (no Developer Mode, not elevated) warns with the
+  link and target and continues, and mode bits are ignored with one warning. Any
+  extraction that skipped an entry exits non-zero with a distinct code so callers can
+  detect an incomplete tree. See [07-open-decisions.md](07-open-decisions.md) #8.
 - **`kv`**: `payload_ciphertext` decrypts to a serialized `BTreeMap<String, Vec<u8>>`
   (`BTreeMap` for deterministic ordering, same rationale as `dir`'s sorted tar).
 
@@ -81,9 +142,24 @@ doc.
   write. XChaCha20-Poly1305's 192-bit nonce makes random generation safe against
   collision for the lifetime of any realistic vault (birthday bound ~2^96 encryptions
   under one key).
-- A given `KEK_i` only ever wraps one data key per credential-enrollment event, and a
-  re-wrap (e.g. after `revoke` touches the header AAD) always draws a fresh nonce —
-  so nonce reuse under a fixed key never happens by construction, not just by luck.
+- **`payload_nonce` is load-bearing.** The data key is fixed for the vault's entire
+  lifetime, and every `lock`, `kv set`, and `kv rm` re-encrypts the whole payload
+  under it. A fixed or reused payload nonce would let anyone holding two versions of
+  the vault file — from cloud-sync history, a filesystem snapshot, a backup set, or
+  git — XOR them to recover the XOR of the two plaintexts, which for two consecutive
+  states of a KV map is almost entirely zeros with a bright stripe at exactly the
+  bytes that changed. Two tags under one Poly1305 one-time key additionally yield
+  forgery. This is why a counter-based nonce is rejected: restoring an older vault
+  from backup and writing again would walk the counter back over values it has
+  already used.
+- `wrap_nonce_i` is, by contrast, **defense in depth**. `KEK_i` is already unique per
+  wrap because `salt_i` is drawn fresh at each enrollment, and a wrap cannot be
+  produced without a device touch (which is also when a fresh salt is drawn), so a
+  fixed nonce would in principle be safe here — the `age` recipient-stanza
+  construction does exactly that. The random nonce costs 24 bytes per credential and
+  keeps the wrap safe even if salt freshness is ever broken by an RNG failure or a
+  restored VM snapshot. Keep it, but note in code that the salt is what actually
+  carries the uniqueness argument.
 
 ## Why not derive the data key directly from the security key (skip the wrap step)?
 
@@ -92,5 +168,5 @@ under a new data key derived from the new device (there's no way to make two
 different physical devices derive the *same* secret). Wrapping a single random data
 key separately per credential is exactly how multi-recipient encryption normally
 works (age, GPG, etc.) and is what makes `enroll`/`revoke` cheap (touch old key once,
-touch new key once, done — no re-encrypting a potentially large `dir`/`file`
-payload).
+touch new key once, rewrite the header, done — no re-encrypting a potentially large
+`dir`/`file` payload).

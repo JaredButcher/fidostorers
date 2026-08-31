@@ -34,7 +34,12 @@ OSes — gets validated as early as possible, before much is built on top of it.
 ## M3 — Directory mode
 - `tar`-based archive/extract, `lock`/`unlock` extended to `dir` mode.
 - Directory round-trip tests incl. nested dirs, symlinks, empty dirs.
-- Windows/Linux tar semantics differences resolved or explicitly documented.
+- Implement the symlink/permission policy settled in
+  [07-open-decisions.md](07-open-decisions.md) #8: full-fidelity archive everywhere,
+  best-effort extraction, per-entry warnings on Windows, non-zero exit when anything
+  was skipped.
+- Manual check on Windows both with and without Developer Mode enabled, since that
+  toggle is what decides whether symlink extraction works at all.
 
 ## M4 — KV mode
 - `kv set/get/rm/ls`.

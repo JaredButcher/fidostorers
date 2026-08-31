@@ -65,7 +65,8 @@ pub struct CredentialEntry {
     pub label: String,
     pub salt: [u8; 32],
     pub wrap_nonce: [u8; 24],
-    /// XChaCha20-Poly1305 ciphertext + tag of the data key, under this entry's KEK.
+    /// XChaCha20-Poly1305 ciphertext + tag of the data key, under this entry's KEK,
+    /// with empty associated data (see plan/03-vault-format-and-crypto.md).
     pub wrapped_data_key: Vec<u8>,
 }
 
@@ -166,11 +167,23 @@ impl Vault {
 
     /// Remove a credential's ability to unlock this vault. Refuses to remove the
     /// last remaining credential, so a vault can never be left unopenable.
-    pub fn revoke(&mut self, credential_id: &[u8]) -> Result<(), VaultError> {
+    ///
+    /// Takes `data_key` because removing an entry changes the header, and
+    /// `header_mac` must be recomputed under a key derived from it (see
+    /// plan/03-vault-format-and-crypto.md). The caller already holds it: revoking
+    /// requires unlocking with a surviving credential first. Note that no other
+    /// credential's wrapped key needs re-wrapping, which is what lets a backup key
+    /// in a safe keep working without being physically present for the revoke.
+    pub fn revoke(
+        &mut self,
+        data_key: &Zeroizing<[u8; 32]>,
+        credential_id: &[u8],
+    ) -> Result<(), VaultError> {
         self.find_credential(credential_id)?;
         if self.credentials.len() <= 1 {
             return Err(VaultError::LastCredential);
         }
+        let _ = data_key;
         Err(VaultError::NotImplemented(
             "revocation lands in M5, see plan/06-roadmap.md",
         ))
@@ -314,14 +327,14 @@ mod tests {
     #[test]
     fn revoke_rejects_last_credential() {
         let mut vault = dummy_vault(vec![dummy_entry(1)]);
-        let err = vault.revoke(&[1]).unwrap_err();
+        let err = vault.revoke(&Zeroizing::new([0u8; 32]), &[1]).unwrap_err();
         assert!(matches!(err, VaultError::LastCredential));
     }
 
     #[test]
     fn revoke_rejects_unknown_credential() {
         let mut vault = dummy_vault(vec![dummy_entry(1), dummy_entry(2)]);
-        let err = vault.revoke(&[99]).unwrap_err();
+        let err = vault.revoke(&Zeroizing::new([0u8; 32]), &[99]).unwrap_err();
         assert!(matches!(err, VaultError::UnknownCredential));
     }
 
@@ -330,7 +343,7 @@ mod tests {
         // Guard clauses are real; the actual header rewrite is M5. Confirms we get
         // past both guards and hit the intended stub, not an early wrong error.
         let mut vault = dummy_vault(vec![dummy_entry(1), dummy_entry(2)]);
-        let err = vault.revoke(&[1]).unwrap_err();
+        let err = vault.revoke(&Zeroizing::new([0u8; 32]), &[1]).unwrap_err();
         assert!(matches!(err, VaultError::NotImplemented(_)));
     }
 
