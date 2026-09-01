@@ -43,19 +43,31 @@ launch requirement.
 ```
 fidostorers/                         workspace root
 ├── Cargo.toml                       [workspace]
+├── .github/workflows/ci.yml         Linux + Windows matrix, clippy/fmt gates
 ├── crates/
 │   ├── fido-token/                  crate 1: device I/O (lib + CLI)
-│   │   ├── src/lib.rs
-│   │   └── src/bin/fido-token.rs
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs               public API + `Authenticator` trait
+│   │       ├── hid.rs               real `HidAuthenticator` (feature `hardware`)
+│   │       ├── enumerate/           passive device discovery (sysfs / SetupAPI)
+│   │       ├── fake.rs              `FakeAuthenticator` for hardware-free tests
+│   │       ├── error.rs             `TokenError`
+│   │       └── bin/fido-token.rs
 │   └── fidostorers/                 crate 2: encryption product (lib + CLI)
-│       ├── src/lib.rs
-│       └── src/bin/fidostorers.rs
-└── plan/, docs/                     this planning material
+│       ├── Cargo.toml
+│       └── src/
+│           ├── lib.rs
+│           ├── vault.rs             header format + crypto pipeline
+│           ├── error.rs             `VaultError`
+│           └── bin/fidostorers.rs
+├── docs/                            user- and developer-facing documentation
+└── plan/                            this planning material
 ```
 
-**Decision:** the currently-empty top-level `src/` is a leftover from repo scaffolding
-and will be removed in favor of the `crates/` workspace layout above once we start
-implementation. Flagged in [07-open-decisions.md](07-open-decisions.md).
+This layout is in place as of M0 ([06-roadmap.md](06-roadmap.md)); the placeholder
+top-level `src/` from the original repo scaffolding has been removed
+([07-open-decisions.md](07-open-decisions.md) #10).
 
 ### Crate 1: `fido-token` — FIDO device communication
 
@@ -75,8 +87,11 @@ See [01-crate-fido-token.md](01-crate-fido-token.md).
 
 A CLI (and thin library) that depends on `fido-token` and implements:
 
-- **Vault**: a header format holding one-or-more wrapped copies of a random data key,
-  one per enrolled security key, so *any* enrolled key can unlock the vault.
+- **Vault**: one `.fido` file holding a header with one-or-more wrapped copies of a
+  random data key, one per enrolled security key, so *any* enrolled key can unlock the
+  vault. The header is not encrypted (nothing in it is secret) but is authenticated by
+  a single `header_mac` under a key derived from the data key; no AEAD call in the
+  format uses associated data.
 - **File mode**: encrypt/decrypt a single file.
 - **Directory mode**: archive a directory tree, then encrypt/decrypt as one blob.
 - **KV mode**: a small encrypted key/value store (one vault file, many named secrets).
@@ -88,17 +103,21 @@ See [02-crate-fidostorers.md](02-crate-fidostorers.md) and
 
 | Concern | Choice | Rationale |
 |---|---|---|
-| CTAP transport | [`authenticator`](https://crates.io/crates/authenticator) crate (Mozilla, used in Firefox) | Only mature Rust crate with CTAP1+CTAP2 support *and* a Windows backend that goes through the OS WebAuthn API (`webauthn.dll`), which is required on Windows 10 1903+ since raw HID access to FIDO devices is blocked for non-admin processes. Also has a Linux/macOS raw-HID backend. Avoids hand-rolling CTAP2/PIN-protocol/HID framing. |
+| CTAP transport | [`authenticator`](https://crates.io/crates/authenticator) crate (Mozilla, used in Firefox) | The mature Rust crate with CTAP1+CTAP2 and a working `hmac-secret` implementation, on Linux and Windows. Avoids hand-rolling CTAP2/PIN-protocol/HID framing. **Correction (M1):** contrary to the original assumption here, this crate has *no* `webauthn.dll` backend — its Windows path is raw USB HID via SetupAPI, the same as Linux. Whether that works unprivileged on Windows 10 1903+ is the open question M1 must answer; see [07-open-decisions.md](07-open-decisions.md) #1 and [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md). |
 | AEAD | XChaCha20-Poly1305 (`chacha20poly1305` crate) | 192-bit nonce removes nonce-reuse foot-guns for randomly generated nonces (relevant since we may write many small KV entries over a vault's lifetime); pure-Rust, constant-time, no hardware AES dependency. |
 | KDF (secret → key) | HKDF-SHA256 (`hkdf` crate) | Standard way to turn the 32-byte `hmac-secret` output into a properly domain-separated AEAD key. |
-| Serialization | `serde` + a binary format (`postcard` or explicit hand-rolled encoding TBD) for vault headers | Deterministic, no-std-friendly options exist if ever needed. |
+| Serialization | `postcard` over `serde`-derived structs for vault headers | Compact and deterministic without hand-rolling an encoder. Encoder-version stability is an ordinary compatibility concern here rather than a security property, because `header_mac` is computed over the literal bytes written to disk and verified over the literal bytes read back. Requires parse-time bounds on every length prefix, since the header is read before it can be authenticated. |
 | Archiving | `tar` crate over the AEAD stream | Simple, well-understood, streams well; avoids reinventing an archive format. |
 | Secret hygiene | `zeroize` crate on all key material structs | Best-effort defense in depth; see [04-security-and-threat-model.md](04-security-and-threat-model.md). |
+| PIN entry | `rpassword` (CLI); optional callback in the library API | No-echo prompt, never persisted. The callback is `Option<...>` because on Windows the OS renders its own PIN dialog and it never fires — see [07-open-decisions.md](07-open-decisions.md) #9. |
 | CLI parsing | `clap` (derive API) | De facto standard, good help/UX, works identically for both crates' binaries. |
 | Errors | `thiserror` (library crates), `anyhow` (CLI binaries) | Standard split: typed errors in libraries, ergonomic bubbling in binaries. |
 
-These are proposed defaults, not commitments — flagged where still open in
-[07-open-decisions.md](07-open-decisions.md).
+All of these are confirmed in [07-open-decisions.md](07-open-decisions.md), which
+records the ten decisions and their rationale. The CTAP transport (#1) is the one
+choice still genuinely in play: M1 found that the Windows path is raw HID rather than
+the OS WebAuthn API, so whether it works for a non-elevated user is now a live
+question rather than a settled assumption.
 
 ## Document index
 
@@ -108,4 +127,4 @@ These are proposed defaults, not commitments — flagged where still open in
 4. [04-security-and-threat-model.md](04-security-and-threat-model.md) — what this protects against, and what it doesn't
 5. [05-testing-strategy.md](05-testing-strategy.md) — unit tests, mock authenticator, hardware-in-the-loop tests
 6. [06-roadmap.md](06-roadmap.md) — phased milestones
-7. [07-open-decisions.md](07-open-decisions.md) — things to confirm before/while implementing
+7. [07-open-decisions.md](07-open-decisions.md) — decision record: what was settled, and why

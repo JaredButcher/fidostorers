@@ -90,5 +90,14 @@ tests structurally cannot cover).
 - `cargo test --workspace` (everything above except the `--ignored` hardware tests)
   on Linux and Windows runners (GitHub Actions matrix), on every push — the whole
   point of the hardware-free split is that this matrix needs no physical keys.
+  Linux runners install `pkg-config` and `libudev-dev` first, which the
+  `authenticator` crate's HID backend links against.
+- The same suite again with `--no-default-features`, which drops the `hardware`
+  feature and with it the platform HID stack. This guards the promise that the
+  hardware-free tests really are hardware-free: they must build and pass on a machine
+  that cannot compile the real backend at all.
 - `cargo clippy --workspace -- -D warnings` and `cargo fmt --check`.
 - Hardware-in-the-loop tests are a manual pre-release checklist item, not a CI gate.
+  The M1 procedure is written up in
+  [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md); `fido-token selftest`
+  packages its acceptance check as one command.

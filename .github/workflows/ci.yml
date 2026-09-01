@@ -23,6 +23,12 @@ jobs:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
 
+      # The `authenticator` crate's Linux HID backend links libudev, so the
+      # default-featured build needs its headers. Windows needs nothing extra.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libudev-dev
+
       - name: Build
         run: cargo build --workspace --all-targets
 
@@ -30,10 +36,16 @@ jobs:
       # security key and are `#[ignore]`-gated; only the hardware-free suite runs
       # here, which is the whole point of the Authenticator trait split.
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --features fido-token/test-util
+
+      # The `hardware` feature is what pulls in the platform HID stack. Building
+      # without it must keep working, so that the hardware-free tests stay runnable
+      # on a machine that cannot satisfy those platform build dependencies.
+      - name: Test without the hardware backend
+        run: cargo test --workspace --no-default-features --features fido-token/test-util
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features fido-token/test-util -- -D warnings
 
       - name: Format check
         run: cargo fmt --all -- --check

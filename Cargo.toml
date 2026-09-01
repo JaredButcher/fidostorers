@@ -10,7 +10,7 @@ repository = "https://github.com/JaredButcher/fidostorers"
 rust-version = "1.75"
 
 [workspace.dependencies]
-fido-token = { path = "crates/fido-token" }
+fido-token = { path = "crates/fido-token", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,6 +21,24 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
+log = "0.4"
+env_logger = "0.11"
+rpassword = "7"
+
+# Mozilla's CTAP1/CTAP2 stack (the one Firefox ships). `crypto_rust` picks the
+# pure-Rust crypto backend so no NSS/OpenSSL system libraries are needed; the
+# default `crypto_nss` backend would drag in bindgen and an NSS install.
+# See plan/07-open-decisions.md #1.
+authenticator = { version = "0.5", default-features = false, features = ["crypto_rust"] }
+
+# Not used directly. `authenticator`'s Windows HID backend passes a
+# `std::os::windows::io::RawHandle` (= `*mut core::ffi::c_void`) to a winapi
+# function expecting `*mut winapi::ctypes::c_void`. Those are the same type only
+# when winapi's `std` feature is on, and `authenticator` does not enable it, so
+# the crate fails to compile for Windows on its own. Declaring winapi here with
+# `std` turns it on graph-wide via feature unification. Remove once the upstream
+# crate enables it itself. See docs/M1-MANUAL-TESTING.md.
+winapi = { version = "0.3.9", features = ["std"] }
 
 [profile.release]
 # Key material lives in this process; strip debug info from release builds so

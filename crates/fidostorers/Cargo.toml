@@ -15,8 +15,14 @@ path = "src/lib.rs"
 name = "fidostorers"
 path = "src/bin/fidostorers.rs"
 
+[features]
+default = ["hardware"]
+# Passes through to `fido-token`'s feature of the same name; see that crate's
+# manifest for why it exists.
+hardware = ["fido-token/hardware"]
+
 [dependencies]
-fido-token.workspace = true
+fido-token = { workspace = true, default-features = false }
 serde.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true

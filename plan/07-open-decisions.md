@@ -7,7 +7,7 @@ overridden rather than left to ossify by momentum.
 
 | # | Decision | Outcome | Notes |
 |---|---|---|---|
-| 1 | FIDO transport crate | [`authenticator`](https://crates.io/crates/authenticator) (Mozilla) | Confirmed, but M1's spike must specifically verify that **hmac-secret salts are plumbed through the Windows backend**, not merely that registration works. Windows exposes salt-based hmac-secret only via a recent WebAuthn API version, and a wrapper can support CTAP2 broadly without surfacing that extension on that backend. Fallback if it fails: `ctap-hid-fido2` on Linux plus direct `webauthn.dll` FFI on Windows — much more work, so fail fast on it. See [06-roadmap.md](06-roadmap.md) M1. |
+| 1 | FIDO transport crate | [`authenticator`](https://crates.io/crates/authenticator) 0.5.0 (Mozilla) — **reopened by an M1 finding** | The premise of this row was wrong. This crate has **no `webauthn.dll` backend**; its Windows path is raw USB HID via SetupAPI, the same as Linux. So the concern was misdirected: salt-based `hmac-secret` *is* fully plumbed through (`HMACGetSecretInput`/`HMACGetSecretOutput`, used identically on both OSes), but the Windows *access* question the original note assumed was solved is not. Windows 10 1903+ denies non-elevated read/write opens of FIDO HID devices, so the question M1's hardware test must now answer is **"does this work without Administrator?"** — [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md) test 3. If it does not, the fallback stands as written: keep this crate on Linux, add direct `webauthn.dll` FFI on Windows. Also note the crate does not compile for Windows as published; see the `winapi` shim in the workspace manifest. |
 | 2 | Crate names | `fido-token` / `fidostorers` | Confirmed for the workspace. Revisit only if publishing: `fido-token` is generic enough that crates.io may want `fidostorers-token`. |
 | 3 | Vault file extension | `.fido` | Confirmed. Chosen over `.fstr` (matches the `FSTR` magic) and `.vault` on the grounds that the extension's job is to tell a human browsing a directory how to open the file, and "use your security key" is the useful signal. The magic bytes stay `FSTR` regardless — extension and magic need not match. |
 | 4 | AEAD cipher | XChaCha20-Poly1305 | Confirmed. The 192-bit nonce is what makes random-per-write nonces safe with no counter state, which matters because KV mode re-encrypts the whole payload on every `set`/`rm` under a data key fixed for the vault's lifetime. See the nonce discipline section of [03-vault-format-and-crypto.md](03-vault-format-and-crypto.md). |
@@ -16,12 +16,28 @@ overridden rather than left to ossify by momentum.
 | 6 | `rp_id` value | Configurable per-vault, default `"fidostorers.local"` | Upgraded from "fixed constant" — costs nothing, the field already exists on `Vault`, `Credential`, and `init --rp-id`. Add to M1's Windows checks that `webauthn.dll` accepts a non-domain rp_id from a native (non-browser) caller. |
 | 7 | Resident vs. non-resident credentials | non-resident (v1) | Confirmed, no change. Deferred per [04-security-and-threat-model.md](04-security-and-threat-model.md). |
 | 8 | Directory-mode symlinks & permissions | Preserve in the archive; best-effort on extract | The tar always stores symlinks as symlink entries and real Unix mode bits, on every OS, so a vault written on Linux round-trips back to Linux with full fidelity no matter where it was stored in between. Extraction applies what the platform allows. On Windows, symlink creation needs Developer Mode or elevation, so a failure warns per-entry (naming the link and its target, and how to enable it) and continues; Unix mode bits are ignored with a single warning. Rejected: dereferencing symlinks at seal time, which is lossy, duplicates bytes, needs cycle detection, and would drop executable bits on scripts. Also rejected: hard-failing extraction, which blocks Windows users entirely on any vault containing a symlink. **Extraction that skipped anything must exit non-zero** with a distinct code, so scripts can detect an incomplete tree rather than trusting a silent success. |
-| 9 | PIN input mechanism | Library takes an optional callback; CLI uses `rpassword` | Confirmed, with one asymmetry to build in from the start: on Windows the OS renders its own PIN dialog, so **the callback is never invoked on that path**. Make it `Option<...>` and let no code path assume it fires. |
+| 9 | PIN input mechanism | Library takes an optional callback (`PinProvider`); CLI uses `rpassword` | Confirmed, but **the stated Windows asymmetry does not exist**: it followed from the belief that Windows went through `webauthn.dll`, and it does not (#1). With a raw-HID backend on both OSes, our callback fires on Windows too and the OS renders no dialog of its own. Keeping it `Option<...>` remains right — `None` means "refuse rather than prompt", which is what `--no-pin` and non-interactive stdin need — but no code path should assume it *fails* to fire on Windows either. Confirm against hardware in test 6. |
 | 10 | Workspace layout | `crates/fido-token`, `crates/fidostorers` | Already implemented; top-level `src/` is gone. Nothing left to decide. |
 
 ## Still open
 
-Nothing. All ten items are decided; see the table above.
+**#1, the FIDO transport, is genuinely open again.** Not because the crate lacks
+`hmac-secret` — it has it, on both OSes — but because the reason the crate was chosen
+(a Windows backend going through the OS WebAuthn API) turned out not to be true. The
+deciding evidence is a single manual test: does `fido-token selftest` pass in a
+non-elevated Windows terminal? See [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md)
+test 3.
 
-#8 governs M3 and #5/#5b govern M2 — both are settled before the milestones that need
-them. #1 remains the one decision that a real-hardware finding in M1 could reopen.
+#9's Windows asymmetry has been **withdrawn** as a consequence of the same finding.
+
+The other eight are settled. #8 governs M3 and #5/#5b govern M2, both ahead of the
+milestones that need them.
+
+## New decisions from M1
+
+| # | Decision | Outcome | Notes |
+|---|---|---|---|
+| 11 | Hardware backend gating | Default-on `hardware` cargo feature | The `authenticator` dependency needs pkg-config + libudev headers on Linux. Putting it behind a feature keeps the hardware-free suite — which [05-testing-strategy.md](05-testing-strategy.md) promises runs everywhere — buildable on machines that cannot supply them, and lets crate 2 be tested without the platform HID stack. With the feature off, `HidAuthenticator` returns `TokenError::BackendUnavailable`. |
+| 12 | Device enumeration | Implemented in-crate, not via `authenticator` | The crate exposes no public enumeration API, and its discovery is entangled with running a real operation (which needs a touch). Listing must be passive, so it is implemented against sysfs (Linux) and SetupAPI (Windows). Consequence: capabilities cannot be reported without a CTAP2 `getInfo`, which needs an I/O open, so `supports_hmac_secret`/`supports_client_pin` became `Option<bool>` and are `None` from enumeration. `selftest` is the authoritative capability answer. |
+| 13 | Secret logging | Never the bytes; a truncated-hash `fingerprint` instead | Debugging a derivation mismatch requires knowing *whether two derivations agree*, which a fingerprint answers without putting key material in a log file. Salts are logged in full — they are not secret ([03-vault-format-and-crypto.md](03-vault-format-and-crypto.md)) and are the other half of what makes a mismatch diagnosable. PINs are never logged. |
+| 14 | Client data hash | Fixed domain-separated constant | CTAP requires 32 bytes to sign over. There is no relying party and the signature is never checked — only the hmac-secret output, which does not depend on this value — so a constant keeps operations reproducible and removes a needless RNG dependency from the derive path. |

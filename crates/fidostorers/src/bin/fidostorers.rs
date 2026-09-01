@@ -122,6 +122,7 @@ fn register_credential(rp_id: String, require_uv: bool) -> Result<fido_token::Cr
         user_name: "fidostorers".to_string(),
         require_uv,
         timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        pin_provider: fido_token::terminal_pin_provider(),
     })?)
 }
 
@@ -143,6 +144,7 @@ fn run() -> Result<()> {
                 &fido_token::DeriveOptions {
                     require_uv,
                     timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+                    pin_provider: fido_token::terminal_pin_provider(),
                 },
             )?;
 

@@ -11,16 +11,43 @@ OSes — gets validated as early as possible, before much is built on top of it.
   [01](01-crate-fido-token.md)/[02](02-crate-fidostorers.md) stubbed out, compiling.
 
 ## M1 — `fido-token` talks to real hardware (spike, both OSes)
-- Wire up the `authenticator` crate, implement `list_devices`, `register`,
-  `derive_secret` for real, behind the `Authenticator` trait.
-- Manually validate on Linux (raw HID) **and** Windows (WebAuthn API backend) with at
-  least one physical key: register a credential, derive twice, confirm identical
-  output. This is the single highest-risk item in the whole project — the rest of the
-  plan assumes this works as documented; if the Windows backend behaves differently
-  than expected, later milestones may need rework.
-- `FakeAuthenticator` + hardware-free unit tests per
+
+**Code: done. Hardware validation: outstanding — this is what M1 still needs.**
+
+- [x] Wire up the `authenticator` crate (0.5.0, `crypto_rust` backend), implement
+  `register` and `derive_secret` for real behind the `Authenticator` trait, gated by
+  the default-on `hardware` feature.
+- [x] `list_devices` implemented directly against the platform (sysfs on Linux,
+  SetupAPI on Windows) rather than via the `authenticator` crate, which exposes no
+  public enumeration API. Passive: no touch, no I/O open, so capabilities report as
+  unprobed.
+- [x] `FakeAuthenticator` + hardware-free unit tests per
   [05-testing-strategy.md](05-testing-strategy.md).
-- `fido-token` CLI (`list`, `register`, `derive`) usable standalone.
+- [x] `fido-token` CLI (`list`, `register`, `derive`, `selftest`) usable standalone,
+  with `-v`/`-vv` logging and stable exit codes.
+- [ ] **Manually validate on Linux and Windows with a physical key.** Procedure:
+  [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md). `fido-token selftest`
+  runs the acceptance check (register → derive twice on one salt → derive on another
+  → assert determinism and salt binding) in a single command.
+
+### Findings so far
+
+Two things turned up while wiring this that the plan had wrong:
+
+1. **The `authenticator` crate has no `webauthn.dll` backend.** Its Windows path is
+   raw USB HID via SetupAPI, exactly like Linux. The plan asserted the opposite in
+   three places (now corrected). Since Windows 10 1903 denies non-elevated read/write
+   opens of FIDO HID devices, **whether the tool works without Administrator on
+   Windows is now the open question** — test 3 of the manual guide. If it needs
+   elevation, [07-open-decisions.md](07-open-decisions.md) #1's fallback (direct
+   `webauthn.dll` FFI) becomes required work, and it is substantial.
+2. **`authenticator` 0.5.0 does not compile for Windows as published** — a
+   `libc::c_void` / `winapi::ctypes::c_void` mismatch. Worked around by declaring
+   `winapi` with its `std` feature in the workspace manifest, which fixes it via
+   feature unification.
+
+Neither invalidates the `hmac-secret` design; the first could still force a different
+transport on Windows.
 
 ## M2 — Vault core + file mode
 - Vault header format, HKDF/AEAD wrap-unwrap pipeline

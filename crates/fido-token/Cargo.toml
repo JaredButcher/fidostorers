@@ -16,6 +16,16 @@ name = "fido-token"
 path = "src/bin/fido-token.rs"
 
 [features]
+default = ["hardware"]
+
+# Compiles the real CTAP2 backend (`HidAuthenticator`) against the
+# `authenticator` crate. On by default; turn it off to build/test the
+# hardware-free parts of this crate on a machine that cannot satisfy the
+# platform build dependencies (Linux needs pkg-config + libudev headers).
+# With it off, `HidAuthenticator`'s methods return
+# `TokenError::BackendUnavailable` and everything else still works.
+hardware = ["dep:authenticator"]
+
 # Exposes `fake::FakeAuthenticator`, a pure-software `Authenticator` impl used by
 # this crate's own tests and reusable by downstream crates (e.g. fidostorers) so
 # their tests don't need physical hardware either. See plan/05-testing-strategy.md.
@@ -31,3 +41,14 @@ anyhow.workspace = true
 rand.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+rpassword.workspace = true
+env_logger.workspace = true
+
+log.workspace = true
+authenticator = { workspace = true, optional = true }
+
+# See the comment on `winapi` in the workspace Cargo.toml: this is a
+# feature-unification shim for `authenticator`'s Windows backend, not a
+# dependency this crate calls into.
+[target.'cfg(windows)'.dependencies]
+winapi = { workspace = true, features = ["setupapi", "hidclass", "hidpi", "hidsdi", "handleapi", "fileapi", "winbase", "errhandlingapi", "guiddef", "minwindef", "ntdef", "winnt", "winerror", "hidusage"] }

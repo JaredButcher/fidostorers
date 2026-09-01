@@ -57,8 +57,13 @@ impl Authenticator for FakeAuthenticator {
         Ok(vec![DeviceInfo {
             path: "fake-0".to_string(),
             product: Some("FakeAuthenticator".to_string()),
-            supports_hmac_secret: true,
-            supports_client_pin: true,
+            manufacturer: Some("fido-token".to_string()),
+            vendor_id: None,
+            product_id: None,
+            // The fake always supports both, and unlike real enumeration it can say
+            // so definitively — there is no device to open.
+            supports_hmac_secret: Some(true),
+            supports_client_pin: Some(true),
         }])
     }
 
@@ -127,6 +132,7 @@ mod tests {
             user_name: "test".to_string(),
             require_uv: false,
             timeout: Duration::from_secs(1),
+            pin_provider: None,
         }
     }
 
@@ -134,6 +140,7 @@ mod tests {
         DeriveOptions {
             require_uv: false,
             timeout: Duration::from_secs(1),
+            pin_provider: None,
         }
     }
 
