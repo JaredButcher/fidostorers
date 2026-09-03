@@ -34,7 +34,37 @@ const EXIT_INCOMPLETE_EXTRACTION: i32 = 20;
 #[command(
     name = "fidostorers",
     version,
-    about = "Encrypt files, directories, and key/value secrets using a FIDO2 security key"
+    about = "Encrypt files, directories, and key/value secrets using a FIDO2 security key",
+    long_about = "Encrypt files, directories, and key/value secrets using a FIDO2 security key.
+
+A vault is unlocked by touching an enrolled security key -- there is no password and
+no recovery path. If every enrolled key is lost, the data is gone permanently. Enroll
+a second key with `fidostorers enroll` and keep it somewhere safe.",
+    after_help = "\
+EXAMPLES:
+  # A single encrypted file
+  fidostorers init secrets.fido --mode file
+  fidostorers lock secrets.fido ./private.txt
+  fidostorers unlock secrets.fido ./private.txt
+
+  # A whole directory tree
+  fidostorers init backup.fido --mode dir
+  fidostorers lock backup.fido ./my-folder
+  fidostorers unlock backup.fido ./restored
+
+  # Many named secrets in one vault
+  fidostorers init tokens.fido --mode kv
+  fidostorers kv set tokens.fido github --stdin < token.txt
+  fidostorers kv get tokens.fido github
+  fidostorers kv ls tokens.fido
+
+  # Add a backup key, then retire the old one
+  fidostorers enroll tokens.fido --label \"backup in safe\"
+  fidostorers info tokens.fido
+  fidostorers revoke tokens.fido --credential <hex-id>
+
+Every unlocking operation requires a live touch. `info` is the only command that
+does not, and its output is therefore unauthenticated."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -44,84 +74,133 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Create a new vault, enrolled with one security key.
+    ///
+    /// Requires two touches: one to create a credential on the key, one to derive
+    /// this vault's key-encryption key. The vault starts empty; use `lock` or
+    /// `kv set` to put something in it.
     Init {
+        /// Path for the new vault file. Refuses to overwrite an existing file.
         vault: PathBuf,
+        /// What this vault will hold. Fixed for the vault's lifetime.
         #[arg(long, value_name = "file|dir|kv")]
         mode: Mode,
+        /// Relying-party identifier bound into the credential. The default is fine
+        /// unless you want vaults that deliberately cannot share credentials.
         #[arg(long, default_value = DEFAULT_RP_ID)]
         rp_id: String,
         /// Name for this key, shown by `fidostorers info`.
         #[arg(long, default_value = "primary")]
         label: String,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
     /// Add another security key that can unlock an existing vault.
+    ///
+    /// Touch an already-enrolled key first, then the new one. Afterwards either key
+    /// opens the vault. Do this before you need it: there is no way to add a key
+    /// once every enrolled key is lost.
     Enroll {
+        /// The vault to add a key to.
         vault: PathBuf,
         /// Name for the new key, shown by `fidostorers info` (e.g. "backup in safe").
         #[arg(long, default_value = "backup")]
         label: String,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
     /// Remove a security key's ability to unlock an existing vault.
+    ///
+    /// This edits THIS file only. The data key is unchanged, so anyone holding the
+    /// revoked key and an older copy of the vault can still read it. If the revoked
+    /// key may be in someone else's hands, create a new vault instead.
     Revoke {
+        /// The vault to remove a key from.
         vault: PathBuf,
         /// Hex-encoded credential ID, as shown by `fidostorers info`.
         #[arg(long)]
         credential: String,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
-    /// (mode = file | dir) Encrypt `input` into the vault.
+    /// Encrypt a file or directory into a vault (mode = file or dir).
+    ///
+    /// Replaces whatever the vault held before.
     Lock {
+        /// The vault to write into.
         vault: PathBuf,
+        /// The file (mode = file) or directory (mode = dir) to encrypt.
         input: PathBuf,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
-    /// (mode = file | dir) Decrypt the vault into `output`.
+    /// Decrypt a vault back out to disk (mode = file or dir).
+    ///
+    /// Exits 20 if the tree was extracted but is incomplete -- see `lock`'s
+    /// counterpart notes about Windows symlinks.
     Unlock {
+        /// The vault to read.
         vault: PathBuf,
+        /// Destination file (mode = file) or directory (mode = dir).
         output: PathBuf,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
-    /// (mode = kv) Manage individual encrypted key/value entries.
+    /// Manage individual encrypted key/value entries (mode = kv).
     Kv {
         #[command(subcommand)]
         command: KvCommands,
     },
-    /// Show a vault's mode, format version, and enrolled credentials. Does not
-    /// require touching a security key.
-    Info { vault: PathBuf },
+    /// Show a vault's mode, format version, and enrolled credentials.
+    ///
+    /// The only command that needs no touch -- and therefore the only one whose
+    /// output is unauthenticated, since checking the header's MAC requires the data
+    /// key. Do not decide anything security-relevant from it.
+    Info {
+        /// The vault to describe.
+        vault: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
 enum KvCommands {
+    /// Store a value, replacing any existing entry of that name.
     Set {
         vault: PathBuf,
+        /// Entry name. Any non-empty string up to 255 bytes.
         name: String,
         #[command(flatten)]
         source: KvValueSource,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
+    /// Write one entry's value to stdout, raw, with no trailing newline.
     Get {
         vault: PathBuf,
+        /// Entry name, as shown by `kv ls`.
         name: String,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
+    /// Delete one entry. Errors if there is no such entry.
     Rm {
         vault: PathBuf,
+        /// Entry name, as shown by `kv ls`.
         name: String,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
+    /// List entry names, one per line, sorted.
     Ls {
         vault: PathBuf,
+        /// Require PIN or biometric verification, not just a touch.
         #[arg(long)]
         require_uv: bool,
     },
@@ -129,10 +208,14 @@ enum KvCommands {
 
 #[derive(Args)]
 struct KvValueSource {
+    /// The value, given on the command line. Visible in your shell history and to
+    /// other processes -- prefer --stdin or --file for anything sensitive.
     #[arg(long, conflicts_with_all = ["stdin", "file"])]
     value: Option<String>,
+    /// Read the value from standard input.
     #[arg(long, conflicts_with_all = ["value", "file"])]
     stdin: bool,
+    /// Read the value from a file.
     #[arg(long, conflicts_with_all = ["value", "stdin"])]
     file: Option<PathBuf>,
 }
@@ -486,6 +569,13 @@ fn run() -> Result<i32> {
                     to_hex(&entry.credential.credential_id)
                 );
             }
+            if vault.credentials().len() == 1 {
+                println!();
+                println!(
+                    "Only one key can open this vault. If it is lost or breaks, the contents are"
+                );
+                println!("gone for good -- `fidostorers enroll` adds a second one.");
+            }
         }
     }
     Ok(0)
@@ -496,9 +586,117 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("error: {err:#}");
+            if let Some(hint) = hint_for(&err) {
+                eprintln!("\nhint: {hint}");
+            }
             std::process::exit(EXIT_ERROR);
         }
     }
+}
+
+/// Turn a typed error into advice about what to actually do next.
+///
+/// The error messages themselves say what went wrong; these say what to try. The
+/// mapping lives here rather than in the library because it is CLI advice ("re-run
+/// with...", "check `fidostorers info`"), not information about the failure.
+fn hint_for(err: &anyhow::Error) -> Option<String> {
+    if let Some(err) = err.downcast_ref::<fido_token::TokenError>() {
+        return Some(token_hint(err));
+    }
+    if let Some(err) = err.downcast_ref::<fidostorers::VaultError>() {
+        return vault_hint(err);
+    }
+    None
+}
+
+fn token_hint(err: &fido_token::TokenError) -> String {
+    use fido_token::TokenError::*;
+    match err {
+        NoDevice => {
+            let mut hint = String::from("Plug in your security key and try again.");
+            if cfg!(target_os = "linux") {
+                hint.push_str(
+                    " On Linux, /dev/hidraw* is root-only by default; you may need a udev \
+                     rule granting your user access (see the README).",
+                );
+            }
+            hint
+        }
+        DeviceAccess(_) => "Windows 10 1903 and later reserve direct access to FIDO devices for \
+             elevated processes. Re-run this from a terminal started with \
+             'Run as Administrator'."
+            .to_string(),
+        HmacSecretUnsupported => "This tool needs the CTAP2 hmac-secret extension, which U2F-only \
+             keys do not have. A YubiKey 5 series, SoloKey, Nitrokey 3, or Token2 will work."
+            .to_string(),
+        Timeout => {
+            "Nothing touched the key in time. Re-run and touch it while it is blinking.".to_string()
+        }
+        NotAllowed => "The key declined the request, or the PIN was wrong. Try again.".to_string(),
+        UnknownCredential => "That key is not enrolled in this vault. Try another key, or run \
+             `fidostorers info` to see which credentials are enrolled."
+            .to_string(),
+        PinRequired(_) => "This key has a PIN set. Run the command from an interactive terminal \
+             so the PIN can be prompted for without echoing."
+            .to_string(),
+        PinBlocked(_) => "Too many incorrect PIN attempts. Unplug and replug the key to reset the \
+             attempt counter. If it is fully blocked, only a factory reset clears it -- which \
+             destroys every credential on the key, and with them every vault they unlock."
+            .to_string(),
+        BackendUnavailable => "This binary was built without the `hardware` feature, so it has no \
+             way to talk to a security key. Rebuild with default features enabled."
+            .to_string(),
+        Transport(_) | NotImplemented(_) => {
+            "Re-run with RUST_LOG=trace to see the CTAP2 exchange.".to_string()
+        }
+    }
+}
+
+fn vault_hint(err: &fidostorers::VaultError) -> Option<String> {
+    use fidostorers::VaultError::*;
+    Some(match err {
+        NotAVault => {
+            "Check the path. This file does not start with a fidostorers header.".to_string()
+        }
+        FormatVersionMismatch { found, supported } => format!(
+            "This vault was written in format v{found} but this build understands v{supported}. \
+             Upgrade fidostorers to open it."
+        ),
+        AuthenticationFailed => "Either a key that is not enrolled in this vault was touched, or \
+             the vault has been modified or corrupted since it was written. If you have a backup \
+             copy, compare against it."
+            .to_string(),
+        UnknownCredential => "Run `fidostorers info` to list the credential IDs enrolled in this \
+             vault."
+            .to_string(),
+        LastCredential => "Enroll another key first (`fidostorers enroll`), then revoke this one. \
+             A vault with no enrolled keys could never be opened again."
+            .to_string(),
+        AlreadyEnrolled => {
+            "That key already unlocks this vault; there is nothing to do.".to_string()
+        }
+        WrongMode { .. } => "A vault's mode is fixed when it is created. `fidostorers info` shows \
+             which mode this one is: use `lock`/`unlock` for file and dir vaults, and \
+             `fidostorers kv` for kv vaults."
+            .to_string(),
+        NoSuchEntry(_) => "Run `fidostorers kv ls` to list the entries in this vault.".to_string(),
+        UnsafeArchivePath(_) => "This vault's archive tried to write outside the directory you \
+             chose. Nothing was extracted from that entry. Treat the vault as untrustworthy."
+            .to_string(),
+        NotADirectory(_) => "A dir-mode vault stores a directory tree; point `lock` at a \
+             directory, not a file."
+            .to_string(),
+        RpIdMismatch { .. } => "The new credential was created for a different rp_id, so it could \
+             never derive a working key for this vault. Enroll without overriding --rp-id."
+            .to_string(),
+        TooManyCredentials { .. } | HeaderTooLarge { .. } => {
+            "Revoke a key you no longer use before enrolling another.".to_string()
+        }
+        MalformedHeader(_) | MalformedPayload(_) | MalformedArchive(_) => "The file is truncated \
+             or corrupt. Restore it from a backup if you have one."
+            .to_string(),
+        InvalidEntryName(_) | NotImplemented(_) | Io(_) | Internal(_) => return None,
+    })
 }
 
 fn from_hex(input: &str) -> Result<Vec<u8>> {

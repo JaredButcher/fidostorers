@@ -197,12 +197,40 @@ failure plan/07 #5b set out to avoid.
    "backup in safe" rather than an opaque credential ID.
 
 ## M6 — Polish & docs
-- User-facing README covering install (incl. Linux udev rules), quick start per mode,
-  and the "you will lose your data if you lose all enrolled keys" warning front and
-  center.
-- CLI help text pass, error message pass (map `TokenError`/`VaultError` variants to
-  actionable messages, not raw debug output).
-- `cargo audit` / dependency review.
+
+**Done.**
+
+- [x] User-facing README: install (incl. Linux udev rules and the Windows elevation
+  requirement), quick start per mode, multi-key workflow, what `revoke` does and does
+  not do, a protects-against table, and the "lose every key and the data is gone"
+  warning as the first thing after the title.
+- [x] CLI help text pass on `fidostorers`: `long_about`, worked examples in
+  `after_help`, and help on every argument (the positional ones had none).
+  `fido-token`'s help was already written in M1 and needed no changes.
+- [x] Error message pass. `fidostorers` now prints an actionable `hint:` line after
+  the error itself, mapped exhaustively from `TokenError`/`VaultError` — "run from an
+  elevated terminal", "enroll another key first, then revoke this one", "check
+  `fidostorers kv ls`". The match is deliberately exhaustive rather than defaulted, so
+  a new variant fails the build until someone decides what to advise; that caught a
+  missed variant while writing it.
+- [x] `cargo audit` in CI as its own job, plus a dependency review (below).
+
+### Dependency review
+
+`cargo audit`, 156 crates: **no vulnerabilities**, one unmaintained-crate warning.
+
+`serde_cbor` 0.11.2 is unmaintained (RUSTSEC-2021-0127). It is reached only via
+`authenticator` → `serde_cbor`, so it is not a dependency this project chose and
+cannot be swapped without replacing the CTAP transport. Worth weighing: it is the code
+that parses CBOR coming *off the device*, which is the one place in the stack where a
+malicious USB device supplies the input. Unmaintained is not the same as vulnerable,
+and no advisory affects it beyond "nobody is looking after it" — but it belongs on the
+list of reasons to revisit [07-open-decisions.md](07-open-decisions.md) #1, alongside
+the Windows elevation limitation, rather than being tracked separately.
+
+Everything else in the direct dependency set is current and actively maintained:
+`chacha20poly1305`, `hkdf`, `hmac`, `sha2` (RustCrypto), `postcard`, `tar`, `tempfile`,
+`zeroize`, `clap`, `anyhow`, `thiserror`, `rand`, `serde`, and `proptest` (dev-only).
 
 ## Phase 2 (explicitly deferred, not committed)
 - **Direct `webauthn.dll` backend for Windows**, to remove the Administrator

@@ -49,3 +49,18 @@ jobs:
 
       - name: Format check
         run: cargo fmt --all -- --check
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Fails on a vulnerability; unmaintained-crate warnings do not fail the build.
+      # As of M6 there is one such warning: serde_cbor, reached only through the
+      # `authenticator` crate. See plan/06-roadmap.md M6.
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit
