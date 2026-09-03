@@ -14,7 +14,7 @@ pub enum VaultError {
     #[error("credential not enrolled in this vault")]
     UnknownCredential,
 
-    #[error("refusing to revoke the last remaining credential")]
+    #[error("refusing to revoke the last remaining factor")]
     LastCredential,
 
     #[error("that security key is already enrolled in this vault")]
@@ -55,6 +55,18 @@ pub enum VaultError {
 
     #[error("refusing to extract an unsafe archive path: {0}")]
     UnsafeArchivePath(String),
+
+    #[error("keyfile cannot be used: {0}")]
+    UnusableKeyfile(String),
+
+    #[error("invalid key-derivation parameters: {0}")]
+    InvalidKdfParams(String),
+
+    #[error("this entry is a {found} factor; {expected} credentials were supplied")]
+    WrongFactorKind {
+        expected: &'static str,
+        found: &'static str,
+    },
 
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),

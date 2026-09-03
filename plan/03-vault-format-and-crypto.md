@@ -127,6 +127,16 @@ back, the header is never re-serialized for authentication purposes — so postc
 cross-version encoding stability is an ordinary compatibility concern governed by
 `format_version`, not a security property.
 
+**Implemented in `FORMAT_VERSION` 2** (M8, [10-keyfile-password-auth.md](10-keyfile-password-auth.md)):
+each credential entry becomes a *factor* entry — a tagged union of a FIDO2 credential
+and a keyfile+password KDF parameter set — and gains a random 16-byte `id` so an entry
+can be named by `info` and `revoke` regardless of type. The key hierarchy above is
+otherwise untouched: a keyfile factor produces a KEK by a different route
+(`Argon2id` rather than `hmac-secret`), and everything downstream of the KEK is
+identical. The tamper table gains one row — editing the Argon2 parameters yields the
+wrong KEK, so the wrap tag fails — and the parse-time caps below extend to cover them,
+since those parameters drive an allocation.
+
 **Parse-time size caps are mandatory.** Length prefixes are read from an
 unauthenticated file and `header_mac` cannot be verified until after the data key is
 recovered, so `credential_count`, `rp_id`'s length, and every length-prefixed byte

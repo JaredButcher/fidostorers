@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::archive::{self, ExtractReport};
@@ -42,7 +43,12 @@ use crate::VaultError;
 
 /// Format version written by this build. Bumped whenever the on-disk layout
 /// changes in an incompatible way.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
+
+/// Version 1 had no [`Factor`] enum and no per-entry id: every entry was a FIDO2
+/// credential. Still readable; rewritten as v2 on the next write. See
+/// plan/10-keyfile-password-auth.md.
+const FORMAT_VERSION_V1: u16 = 1;
 
 const MAGIC: [u8; 4] = *b"FSTR";
 /// magic + format_version + header_len.
@@ -96,20 +102,93 @@ impl FromStr for Mode {
     }
 }
 
-/// One enrolled credential's entry in the vault header: everything needed to
-/// re-derive its KEK and unwrap the data key, none of it secret on its own.
+/// How one enrolled entry produces its KEK.
+///
+/// Both routes end at 32 bytes that unwrap the same data key, which is why adding a
+/// second factor type touched nothing below the KEK (plan/10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Factor {
+    /// A security key, via the CTAP2 `hmac-secret` extension.
+    Fido2(fido_token::Credential),
+    /// A keyfile and a password, via Argon2id.
+    Keyfile(crate::KeyfileParams),
+}
+
+impl Factor {
+    /// Short name for messages and `info` output.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Factor::Fido2(_) => "fido2",
+            Factor::Keyfile(_) => "keyfile",
+        }
+    }
+
+    pub fn credential(&self) -> Option<&fido_token::Credential> {
+        match self {
+            Factor::Fido2(credential) => Some(credential),
+            Factor::Keyfile(_) => None,
+        }
+    }
+}
+
+/// One enrolled entry in the vault header: everything needed to re-derive its KEK and
+/// unwrap the data key, none of it secret on its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CredentialEntry {
-    pub credential: fido_token::Credential,
+pub struct FactorEntry {
+    /// Random at enrollment. A stable name for this entry regardless of factor type,
+    /// since a keyfile factor has no credential ID to be named by.
+    pub id: [u8; 16],
+    pub factor: Factor,
     /// User-supplied label (e.g. "primary", "backup in safe"), for UX only.
     pub label: String,
-    /// Fed to `hmac-secret` to derive this credential's KEK. Not secret: its job is
-    /// domain separation between this vault and any other using the same key.
+    /// Fed to the KDF to derive this entry's KEK. Not secret: its job is domain
+    /// separation between this vault and any other using the same key or keyfile.
     pub salt: [u8; 32],
     pub wrap_nonce: [u8; 24],
     /// XChaCha20-Poly1305 ciphertext + tag of the data key, under this entry's KEK,
     /// with empty associated data.
     pub wrapped_data_key: Vec<u8>,
+}
+
+impl FactorEntry {
+    /// Lowercase hex of [`FactorEntry::id`], as `info` prints it and `revoke --id`
+    /// accepts it.
+    pub fn id_hex(&self) -> String {
+        fido_token::to_hex(&self.id)
+    }
+}
+
+/// A version-1 header entry, kept only so v1 vaults still open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CredentialEntryV1 {
+    credential: fido_token::Credential,
+    label: String,
+    salt: [u8; 32],
+    wrap_nonce: [u8; 24],
+    wrapped_data_key: Vec<u8>,
+}
+
+impl From<CredentialEntryV1> for FactorEntry {
+    fn from(old: CredentialEntryV1) -> Self {
+        // A v1 entry has no id. Derive one from its credential ID so the value is
+        // stable across opens: a random id would change every time the vault was
+        // read, and `revoke --id` would name a different entry each session.
+        let mut hasher = Sha256::new();
+        hasher.update(b"fidostorers-v1-entry-id");
+        hasher.update(&old.credential.credential_id);
+        let digest = hasher.finalize();
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&digest[..16]);
+
+        FactorEntry {
+            id,
+            factor: Factor::Fido2(old.credential),
+            label: old.label,
+            salt: old.salt,
+            wrap_nonce: old.wrap_nonce,
+            wrapped_data_key: old.wrapped_data_key,
+        }
+    }
 }
 
 /// Everything the caller must supply to give one security key the ability to unlock
@@ -120,12 +199,63 @@ pub struct CredentialEntry {
 /// wrongly can never re-derive it. Bundling them makes that impossible to get
 /// wrong at a call site.
 pub struct Enrollment {
-    pub credential: fido_token::Credential,
+    pub factor: Factor,
+    /// The vault's relying-party identifier.
+    ///
+    /// A FIDO2 credential carries its own and must agree with this. A keyfile factor
+    /// has no relying party at all — there is no authenticator involved — so it simply
+    /// adopts whatever the vault uses, which is why this cannot be inferred from the
+    /// factor alone.
+    pub rp_id: String,
     pub label: String,
     /// The salt used to derive `kek`. Stored in the header verbatim.
     pub salt: [u8; 32],
+    /// For a `Fido2` factor:
     /// `crypto::kek_from_secret(&fido_token::derive_secret(&credential, &salt, ..))`.
+    /// For a `Keyfile` factor: `keyfile::derive_kek(&hash, password, &salt, &params)`.
     pub kek: Zeroizing<[u8; 32]>,
+}
+
+/// The version-1 header body, kept only so v1 vaults still open.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HeaderBodyV1 {
+    mode: Mode,
+    rp_id: String,
+    credentials: Vec<CredentialEntryV1>,
+    payload_nonce: [u8; 24],
+    payload_len: u64,
+}
+
+impl From<HeaderBodyV1> for HeaderBody {
+    fn from(old: HeaderBodyV1) -> Self {
+        HeaderBody {
+            mode: old.mode,
+            rp_id: old.rp_id,
+            credentials: old.credentials.into_iter().map(FactorEntry::from).collect(),
+            payload_nonce: old.payload_nonce,
+            payload_len: old.payload_len,
+        }
+    }
+}
+
+impl Enrollment {
+    /// A FIDO2 credential that disagrees with the vault's rp_id could never derive a
+    /// working KEK, so catching it here beats enrolling a factor that silently never
+    /// works.
+    fn check_rp_id(&self, vault_rp_id: &str) -> Result<(), VaultError> {
+        let found = match &self.factor {
+            Factor::Fido2(credential) => &credential.rp_id,
+            Factor::Keyfile(_) => &self.rp_id,
+        };
+        if found == vault_rp_id {
+            Ok(())
+        } else {
+            Err(VaultError::RpIdMismatch {
+                expected: vault_rp_id.to_string(),
+                found: found.clone(),
+            })
+        }
+    }
 }
 
 /// The postcard-serialized part of the header.
@@ -133,7 +263,7 @@ pub struct Enrollment {
 struct HeaderBody {
     mode: Mode,
     rp_id: String,
-    credentials: Vec<CredentialEntry>,
+    credentials: Vec<FactorEntry>,
     payload_nonce: [u8; 24],
     /// Plaintext length. The payload occupies `payload_len + TAG_LEN` bytes on disk.
     payload_len: u64,
@@ -175,6 +305,10 @@ impl Vault {
     /// The vault's `rp_id` is taken from the credential, so the header and the
     /// credential can never disagree about it.
     pub fn create(path: &Path, mode: Mode, enrollment: &Enrollment) -> Result<Self, VaultError> {
+        enrollment.check_rp_id(&enrollment.rp_id)?;
+        if let Factor::Keyfile(params) = &enrollment.factor {
+            params.validate_for_write()?;
+        }
         let data_key = crypto::random_key();
         let entry = wrap_for(enrollment, &data_key)?;
 
@@ -187,7 +321,7 @@ impl Vault {
 
         let body = HeaderBody {
             mode,
-            rp_id: enrollment.credential.rp_id.clone(),
+            rp_id: enrollment.rp_id.clone(),
             credentials: vec![entry],
             payload_nonce,
             payload_len: initial.len() as u64,
@@ -223,7 +357,7 @@ impl Vault {
             return Err(VaultError::NotAVault);
         }
         let format_version = u16::from_le_bytes([prefix[4], prefix[5]]);
-        if format_version != FORMAT_VERSION {
+        if format_version != FORMAT_VERSION && format_version != FORMAT_VERSION_V1 {
             return Err(VaultError::FormatVersionMismatch {
                 found: format_version,
                 supported: FORMAT_VERSION,
@@ -245,8 +379,20 @@ impl Vault {
         let mut header_mac = [0u8; MAC_LEN];
         read_exact(&mut file, &mut header_mac, "header MAC")?;
 
-        let body: HeaderBody = postcard::from_bytes(&body_bytes)
-            .map_err(|err| VaultError::MalformedHeader(format!("cannot parse header: {err}")))?;
+        // A v1 header has no `Factor` tag and no per-entry id, so it needs its own
+        // parse; the result converts into the current shape and is written back as v2
+        // on the next write (plan/10). `header_mac` is verified over the literal bytes
+        // read here, so an upgrade is just a normal write, not a re-encoding.
+        let body: HeaderBody = if format_version == FORMAT_VERSION_V1 {
+            postcard::from_bytes::<HeaderBodyV1>(&body_bytes)
+                .map_err(|err| {
+                    VaultError::MalformedHeader(format!("cannot parse v1 header: {err}"))
+                })?
+                .into()
+        } else {
+            postcard::from_bytes(&body_bytes)
+                .map_err(|err| VaultError::MalformedHeader(format!("cannot parse header: {err}")))?
+        };
         validate(&body)?;
 
         let payload_offset = (PREFIX_LEN + header_len + MAC_LEN) as u64;
@@ -291,16 +437,34 @@ impl Vault {
         self.format_version
     }
 
-    pub fn credentials(&self) -> &[CredentialEntry] {
+    pub fn credentials(&self) -> &[FactorEntry] {
         &self.body.credentials
     }
 
-    fn find_credential(&self, credential_id: &[u8]) -> Result<&CredentialEntry, VaultError> {
+    /// Look an entry up by its entry id, falling back to a FIDO2 credential id.
+    ///
+    /// The fallback keeps `unlock_with` working for callers that still hold a
+    /// credential id (and for `revoke --credential`), without making a keyfile factor
+    /// unaddressable.
+    fn find_entry(&self, id: &[u8]) -> Result<&FactorEntry, VaultError> {
         self.body
             .credentials
             .iter()
-            .find(|entry| entry.credential.credential_id == credential_id)
+            .find(|entry| entry.id == id)
+            .or_else(|| {
+                self.body.credentials.iter().find(|entry| {
+                    entry
+                        .factor
+                        .credential()
+                        .is_some_and(|c| c.credential_id == id)
+                })
+            })
             .ok_or(VaultError::UnknownCredential)
+    }
+
+    fn position_of(&self, id: &[u8]) -> Option<usize> {
+        let target = self.find_entry(id).ok()?.id;
+        self.body.credentials.iter().position(|e| e.id == target)
     }
 
     /// Unwrap the data key using `credential_id`'s already-derived KEK, then verify
@@ -322,7 +486,7 @@ impl Vault {
         credential_id: &[u8],
         kek: Zeroizing<[u8; 32]>,
     ) -> Result<Zeroizing<[u8; 32]>, VaultError> {
-        let entry = self.find_credential(credential_id)?;
+        let entry = self.find_entry(credential_id)?;
         let unwrapped = crypto::unseal(&kek, &entry.wrap_nonce, &entry.wrapped_data_key)?;
 
         let data_key: Zeroizing<[u8; 32]> = Zeroizing::new(
@@ -363,19 +527,23 @@ impl Vault {
     ) -> Result<(), VaultError> {
         self.verify_header(data_key)?;
 
-        if enrollment.credential.rp_id != self.body.rp_id {
-            return Err(VaultError::RpIdMismatch {
-                expected: self.body.rp_id.clone(),
-                found: enrollment.credential.rp_id.clone(),
-            });
+        enrollment.check_rp_id(&self.body.rp_id)?;
+        if let Factor::Keyfile(params) = &enrollment.factor {
+            params.validate_for_write()?;
         }
-        if self
-            .body
-            .credentials
-            .iter()
-            .any(|entry| entry.credential.credential_id == enrollment.credential.credential_id)
-        {
-            return Err(VaultError::AlreadyEnrolled);
+        // Only a FIDO2 credential can be "already enrolled" in a detectable way. Two
+        // keyfile factors over the same file and password are legitimate (different
+        // salts, different labels) and indistinguishable from here without the
+        // password, so there is nothing to check.
+        if let Some(new) = enrollment.factor.credential() {
+            if self.body.credentials.iter().any(|entry| {
+                entry
+                    .factor
+                    .credential()
+                    .is_some_and(|c| c.credential_id == new.credential_id)
+            }) {
+                return Err(VaultError::AlreadyEnrolled);
+            }
         }
         if self.body.credentials.len() >= MAX_CREDENTIALS {
             return Err(VaultError::TooManyCredentials {
@@ -413,10 +581,7 @@ impl Vault {
         self.verify_header(data_key)?;
 
         let index = self
-            .body
-            .credentials
-            .iter()
-            .position(|entry| entry.credential.credential_id == credential_id)
+            .position_of(credential_id)
             .ok_or(VaultError::UnknownCredential)?;
         if self.body.credentials.len() <= 1 {
             return Err(VaultError::LastCredential);
@@ -529,6 +694,9 @@ impl Vault {
                 max: MAX_HEADER_LEN,
             });
         }
+
+        // Always emit the current version: a v1 vault read above is upgraded here.
+        self.format_version = FORMAT_VERSION;
 
         let mut mac_covered = Vec::with_capacity(PREFIX_LEN + body_bytes.len());
         mac_covered.extend_from_slice(&MAGIC);
@@ -664,11 +832,14 @@ fn empty_payload(mode: Mode) -> Result<Vec<u8>, VaultError> {
 fn wrap_for(
     enrollment: &Enrollment,
     data_key: &Zeroizing<[u8; 32]>,
-) -> Result<CredentialEntry, VaultError> {
+) -> Result<FactorEntry, VaultError> {
     let wrap_nonce = crypto::random_nonce();
     let wrapped_data_key = crypto::seal(&enrollment.kek, &wrap_nonce, &data_key[..])?;
-    Ok(CredentialEntry {
-        credential: enrollment.credential.clone(),
+    let mut id = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+    Ok(FactorEntry {
+        id,
+        factor: enrollment.factor.clone(),
         label: enrollment.label.clone(),
         salt: enrollment.salt,
         wrap_nonce,
@@ -697,15 +868,35 @@ fn validate(body: &HeaderBody) -> Result<(), VaultError> {
             body.credentials.len()
         ));
     }
+    let mut seen_ids = std::collections::HashSet::new();
     for (i, entry) in body.credentials.iter().enumerate() {
-        if entry.credential.credential_id.is_empty() {
-            return malformed(format!("credential {i} has an empty id"));
+        if !seen_ids.insert(entry.id) {
+            return malformed(format!("entry {i} reuses another entry's id"));
         }
-        if entry.credential.credential_id.len() > MAX_CREDENTIAL_ID_LEN {
-            return malformed(format!(
-                "credential {i}'s id is {} bytes, over the {MAX_CREDENTIAL_ID_LEN}-byte cap",
-                entry.credential.credential_id.len()
-            ));
+        match &entry.factor {
+            Factor::Fido2(credential) => {
+                if credential.credential_id.is_empty() {
+                    return malformed(format!("credential {i} has an empty id"));
+                }
+                if credential.credential_id.len() > MAX_CREDENTIAL_ID_LEN {
+                    return malformed(format!(
+                        "credential {i}'s id is {} bytes, over the {MAX_CREDENTIAL_ID_LEN}-byte cap",
+                        credential.credential_id.len()
+                    ));
+                }
+                // `fido_token::Credential` carries its own rp_id, so the header states
+                // it twice. `create` sources both from the same place; a file where
+                // they disagree was not written by us.
+                if credential.rp_id != body.rp_id {
+                    return malformed(format!(
+                        "credential {i}'s rp_id {:?} does not match the vault's {:?}",
+                        credential.rp_id, body.rp_id
+                    ));
+                }
+            }
+            // Read before `header_mac` can be verified, and they drive an allocation,
+            // so these are capped exactly like the header's length prefixes.
+            Factor::Keyfile(params) => params.validate_for_read()?,
         }
         if entry.label.len() > MAX_LABEL_LEN {
             return malformed(format!(
@@ -717,15 +908,6 @@ fn validate(body: &HeaderBody) -> Result<(), VaultError> {
             return malformed(format!(
                 "credential {i}'s wrapped key is {} bytes, expected {WRAPPED_DATA_KEY_LEN}",
                 entry.wrapped_data_key.len()
-            ));
-        }
-        // `fido_token::Credential` carries its own rp_id, so the header states it
-        // twice. `create` sources both from the same place; a file where they
-        // disagree was not written by us.
-        if entry.credential.rp_id != body.rp_id {
-            return malformed(format!(
-                "credential {i}'s rp_id {:?} does not match the vault's {:?}",
-                entry.credential.rp_id, body.rp_id
             ));
         }
     }
@@ -766,9 +948,26 @@ mod tests {
     /// whole point of the KEK-in / KEK-out seam is that a test can just pick bytes.
     fn enrollment(id: u8, kek: [u8; 32]) -> Enrollment {
         Enrollment {
-            credential: credential(id),
+            factor: Factor::Fido2(credential(id)),
+            rp_id: "fidostorers.local".to_string(),
             label: "primary".to_string(),
             salt: [id; 32],
+            kek: Zeroizing::new(kek),
+        }
+    }
+
+    /// A keyfile factor with the cheapest parameters the validator accepts, so tests
+    /// exercising the format do not each pay for a real Argon2 run.
+    fn keyfile_enrollment(kek: [u8; 32], label: &str) -> Enrollment {
+        Enrollment {
+            factor: Factor::Keyfile(crate::KeyfileParams {
+                m_cost_kib: crate::keyfile::MIN_M_COST_KIB,
+                t_cost: crate::keyfile::MIN_T_COST,
+                parallelism: crate::keyfile::MIN_PARALLELISM,
+            }),
+            rp_id: "fidostorers.local".to_string(),
+            label: label.to_string(),
+            salt: [0x5A; 32],
             kek: Zeroizing::new(kek),
         }
     }
@@ -1356,6 +1555,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_header_stores_credential_ids_as_raw_bytes_not_hex() {
+        // M7 made `fido-token` print credential IDs as hex in its JSON. That must not
+        // reach the vault format: `fido_token::Credential`'s serde impl defines this
+        // header's layout too, and hex would double the field's size and break every
+        // existing vault. See plan/09-credential-encoding.md and plan/07 #17.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v.fido");
+        let mut enrolled = enrollment(1, KEK_A);
+        enrolled.factor = Factor::Fido2(fido_token::Credential {
+            rp_id: "fidostorers.local".to_string(),
+            credential_id: vec![0xA1, 0xB2, 0xC3, 0xD4],
+            device_hint: None,
+        });
+        Vault::create(&path, Mode::File, &enrolled).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        // postcard writes a Vec<u8> as a varint length then the raw bytes.
+        let raw = [0x04, 0xA1, 0xB2, 0xC3, 0xD4];
+        assert!(
+            bytes.windows(raw.len()).any(|w| w == raw),
+            "credential_id is not stored as length-prefixed raw bytes"
+        );
+        assert!(
+            !bytes.windows(8).any(|w| w == b"a1b2c3d4"),
+            "credential_id leaked into the header as hex text"
+        );
+    }
+
     // ---------- multi-key enrollment and revocation (M5) ----------
 
     #[test]
@@ -1487,7 +1715,11 @@ mod tests {
             .unwrap();
 
         let mut foreign = enrollment(2, KEK_B);
-        foreign.credential.rp_id = "somewhere.else".to_string();
+        foreign.factor = Factor::Fido2(fido_token::Credential {
+            rp_id: "somewhere.else".to_string(),
+            credential_id: credential(2).credential_id,
+            device_hint: None,
+        });
         let err = vault.enroll(&data_key, &foreign).unwrap_err();
         assert!(
             matches!(err, VaultError::RpIdMismatch { .. }),
@@ -1512,7 +1744,10 @@ mod tests {
         let entry = &reopened.credentials()[1];
         assert_eq!(entry.label, "backup in safe");
         assert_eq!(entry.salt, [0x2Bu8; 32]);
-        assert_eq!(entry.credential.credential_id, credential(2).credential_id);
+        assert_eq!(
+            entry.factor.credential().unwrap().credential_id,
+            credential(2).credential_id
+        );
     }
 
     #[test]
@@ -1581,6 +1816,313 @@ mod tests {
             Err(VaultError::LastCredential)
         ));
         assert_eq!(vault.credentials().len(), 1);
+    }
+
+    // ---------- keyfile + password factors (M8) ----------
+
+    #[test]
+    fn a_vault_can_be_created_from_a_keyfile_factor_alone() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("kf.fido");
+        let enrolled = keyfile_enrollment(KEK_B, "keyfile");
+        let vault = Vault::create(&path, Mode::File, &enrolled).unwrap();
+        let id = vault.credentials()[0].id;
+
+        let reopened = Vault::open(&path).unwrap();
+        assert_eq!(reopened.credentials().len(), 1);
+        assert_eq!(reopened.credentials()[0].factor.kind(), "keyfile");
+        assert!(reopened.credentials()[0].factor.credential().is_none());
+        assert!(reopened.unlock_with(&id, kek(KEK_B)).is_ok());
+    }
+
+    #[test]
+    fn a_vault_can_hold_both_factor_kinds_and_either_unlocks_it() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault
+            .enroll(&data_key, &keyfile_enrollment(KEK_B, "keyfile backup"))
+            .unwrap();
+
+        let reopened = Vault::open(&path).unwrap();
+        assert_eq!(reopened.credentials().len(), 2);
+        assert_eq!(reopened.credentials()[0].factor.kind(), "fido2");
+        assert_eq!(reopened.credentials()[1].factor.kind(), "keyfile");
+
+        let via_fido = reopened
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        let via_keyfile = reopened
+            .unlock_with(&reopened.credentials()[1].id, kek(KEK_B))
+            .unwrap();
+        assert_eq!(*via_fido, *via_keyfile);
+        assert_eq!(*via_fido, *data_key);
+    }
+
+    #[test]
+    fn revoking_one_factor_kind_leaves_the_other_working() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault
+            .enroll(&data_key, &keyfile_enrollment(KEK_B, "keyfile backup"))
+            .unwrap();
+        let keyfile_id = vault.credentials()[1].id;
+
+        vault
+            .revoke(&data_key, &credential(1).credential_id)
+            .unwrap();
+
+        let reopened = Vault::open(&path).unwrap();
+        assert_eq!(reopened.credentials().len(), 1);
+        assert!(matches!(
+            reopened.unlock_with(&credential(1).credential_id, kek(KEK_A)),
+            Err(VaultError::UnknownCredential)
+        ));
+        assert_eq!(
+            *reopened.unlock_with(&keyfile_id, kek(KEK_B)).unwrap(),
+            *data_key
+        );
+    }
+
+    #[test]
+    fn entry_ids_are_unique_and_addressable() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault
+            .enroll(&data_key, &keyfile_enrollment(KEK_B, "one"))
+            .unwrap();
+        let mut third = keyfile_enrollment([0x11; 32], "two");
+        third.salt = [0x77; 32];
+        vault.enroll(&data_key, &third).unwrap();
+
+        let ids: Vec<_> = vault.credentials().iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), 3);
+        assert_ne!(ids[0], ids[1]);
+        assert_ne!(ids[1], ids[2]);
+        // Two keyfile factors over the same file are legitimate and must both work.
+        assert!(vault.unlock_with(&ids[1], kek(KEK_B)).is_ok());
+        assert!(vault.unlock_with(&ids[2], kek([0x11; 32])).is_ok());
+        assert_eq!(vault.credentials()[1].id_hex().len(), 32);
+    }
+
+    #[test]
+    fn enroll_rejects_out_of_range_argon2_parameters() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+
+        let mut weak = keyfile_enrollment(KEK_B, "too weak");
+        weak.factor = Factor::Keyfile(crate::KeyfileParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            parallelism: 1,
+        });
+        assert!(matches!(
+            vault.enroll(&data_key, &weak),
+            Err(VaultError::InvalidKdfParams(_))
+        ));
+        assert_eq!(vault.credentials().len(), 1);
+    }
+
+    #[test]
+    fn argon2_parameters_survive_a_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("kf.fido");
+        let mut enrolled = keyfile_enrollment(KEK_B, "keyfile");
+        let params = crate::KeyfileParams {
+            m_cost_kib: 16 * 1024,
+            t_cost: 2,
+            parallelism: 2,
+        };
+        enrolled.factor = Factor::Keyfile(params);
+        Vault::create(&path, Mode::File, &enrolled).unwrap();
+
+        let reopened = Vault::open(&path).unwrap();
+        match &reopened.credentials()[0].factor {
+            Factor::Keyfile(stored) => assert_eq!(*stored, params),
+            other => panic!("expected a keyfile factor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hostile_kdf_parameter_is_rejected_at_parse_time() {
+        // Same discipline as the header's length prefixes: these are read before
+        // header_mac can be verified and they drive an allocation, so an absurd
+        // m_cost must fail on the bound rather than be attempted. Built by hand
+        // because no honest writer would ever produce it.
+        let body = HeaderBody {
+            mode: Mode::File,
+            rp_id: "fidostorers.local".to_string(),
+            credentials: vec![FactorEntry {
+                id: [1u8; 16],
+                factor: Factor::Keyfile(crate::KeyfileParams {
+                    m_cost_kib: u32::MAX,
+                    t_cost: 1,
+                    parallelism: 1,
+                }),
+                label: "hostile".to_string(),
+                salt: [0u8; 32],
+                wrap_nonce: [0u8; 24],
+                wrapped_data_key: vec![0u8; WRAPPED_DATA_KEY_LEN],
+            }],
+            payload_nonce: [0u8; 24],
+            payload_len: 0,
+        };
+        let body_bytes = postcard::to_stdvec(&body).unwrap();
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&MAGIC);
+        file.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        file.extend_from_slice(&(body_bytes.len() as u32).to_le_bytes());
+        file.extend_from_slice(&body_bytes);
+        file.extend_from_slice(&[0u8; MAC_LEN]);
+        file.extend_from_slice(&[0u8; TAG_LEN]);
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("hostile.fido");
+        std::fs::write(&path, &file).unwrap();
+
+        match Vault::open(&path) {
+            Err(VaultError::MalformedHeader(msg)) => assert!(msg.contains("Argon2"), "{msg}"),
+            other => panic!("expected MalformedHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_keyfile_factor_needs_no_relying_party() {
+        // The rp_id comes from the vault, since a keyfile factor has no authenticator
+        // and therefore no relying party of its own.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("kf.fido");
+        let mut enrolled = keyfile_enrollment(KEK_B, "keyfile");
+        enrolled.rp_id = "something.custom".to_string();
+        let vault = Vault::create(&path, Mode::File, &enrolled).unwrap();
+        assert_eq!(vault.rp_id(), "something.custom");
+        assert_eq!(Vault::open(&path).unwrap().rp_id(), "something.custom");
+    }
+
+    // ---------- format version 1 compatibility (M8) ----------
+
+    /// Build a v1 vault by hand: the format M2-M7 wrote, before factors existed.
+    fn write_v1_vault(path: &Path, data_key: &[u8; 32], kek: &[u8; 32]) {
+        let wrap_nonce = crypto::random_nonce();
+        let wrapped_data_key = crypto::seal(kek, &wrap_nonce, &data_key[..]).unwrap();
+
+        let body = HeaderBodyV1 {
+            mode: Mode::File,
+            rp_id: "fidostorers.local".to_string(),
+            credentials: vec![CredentialEntryV1 {
+                credential: credential(1),
+                label: "primary".to_string(),
+                salt: [1u8; 32],
+                wrap_nonce,
+                wrapped_data_key,
+            }],
+            payload_nonce: crypto::random_nonce(),
+            payload_len: 0,
+        };
+        let body_bytes = postcard::to_stdvec(&body).unwrap();
+
+        let mut covered = Vec::new();
+        covered.extend_from_slice(&MAGIC);
+        covered.extend_from_slice(&FORMAT_VERSION_V1.to_le_bytes());
+        covered.extend_from_slice(&(body_bytes.len() as u32).to_le_bytes());
+        covered.extend_from_slice(&body_bytes);
+
+        let mac_key = crypto::mac_key_from_data_key(data_key);
+        let mac = crypto::header_mac(&mac_key, &covered);
+        let payload = crypto::seal(data_key, &body.payload_nonce, &[]).unwrap();
+
+        let mut file = covered;
+        file.extend_from_slice(&mac);
+        file.extend_from_slice(&payload);
+        std::fs::write(path, &file).unwrap();
+    }
+
+    #[test]
+    fn a_v1_vault_still_opens_and_unlocks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.fido");
+        let data_key = [0x42u8; 32];
+        write_v1_vault(&path, &data_key, &KEK_A);
+
+        let vault = Vault::open(&path).unwrap();
+        assert_eq!(vault.format_version(), FORMAT_VERSION_V1);
+        assert_eq!(vault.credentials().len(), 1);
+        assert_eq!(vault.credentials()[0].factor.kind(), "fido2");
+        assert_eq!(vault.credentials()[0].label, "primary");
+
+        let unlocked = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        assert_eq!(*unlocked, data_key);
+    }
+
+    #[test]
+    fn a_v1_vault_is_rewritten_as_v2_on_the_next_write() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.fido");
+        write_v1_vault(&path, &[0x42u8; 32], &KEK_A);
+
+        let mut vault = Vault::open(&path).unwrap();
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+
+        let input = dir.path().join("input.bin");
+        std::fs::write(&input, b"written after the upgrade").unwrap();
+        vault.seal_file(&data_key, &input).unwrap();
+
+        let upgraded = Vault::open(&path).unwrap();
+        assert_eq!(upgraded.format_version(), FORMAT_VERSION);
+        // Same key, same label, same data — only the encoding moved.
+        let via_upgraded = upgraded
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        assert_eq!(*via_upgraded, *data_key);
+        assert_eq!(upgraded.credentials()[0].label, "primary");
+
+        let out = dir.path().join("out.bin");
+        upgraded.open_file(&via_upgraded, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"written after the upgrade");
+    }
+
+    #[test]
+    fn a_v1_entry_gets_a_stable_id() {
+        // Derived from the credential ID rather than drawn at random: a random id
+        // would differ on every open, so `revoke --id` would name a different entry
+        // each time the vault was read.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.fido");
+        write_v1_vault(&path, &[0x42u8; 32], &KEK_A);
+
+        let first = Vault::open(&path).unwrap().credentials()[0].id;
+        let second = Vault::open(&path).unwrap().credentials()[0].id;
+        assert_eq!(first, second);
+        assert_ne!(first, [0u8; 16]);
+    }
+
+    #[test]
+    fn a_future_format_version_is_still_rejected() {
+        let dir = TempDir::new().unwrap();
+        let (path, _) = new_vault(&dir, Mode::File);
+        corrupt(&path, |bytes| {
+            bytes[4..6].copy_from_slice(&999u16.to_le_bytes())
+        });
+        assert!(matches!(
+            Vault::open(&path),
+            Err(VaultError::FormatVersionMismatch { found: 999, .. })
+        ));
     }
 
     // ---------- kv mode (M4) ----------
@@ -1814,8 +2356,9 @@ mod tests {
         let base = HeaderBody {
             mode: Mode::File,
             rp_id: "fidostorers.local".to_string(),
-            credentials: vec![CredentialEntry {
-                credential: credential(1),
+            credentials: vec![FactorEntry {
+                id: [1u8; 16],
+                factor: Factor::Fido2(credential(1)),
                 label: "primary".to_string(),
                 salt: [1u8; 32],
                 wrap_nonce: [1u8; 24],
@@ -1835,8 +2378,12 @@ mod tests {
         assert!(validate(&long_rp_id).is_err());
 
         let mut too_many = base.clone();
-        too_many.credentials = std::iter::repeat(base.credentials[0].clone())
-            .take(MAX_CREDENTIALS + 1)
+        too_many.credentials = (0..=MAX_CREDENTIALS as u8)
+            .map(|i| {
+                let mut entry = base.credentials[0].clone();
+                entry.id = [i; 16];
+                entry
+            })
             .collect();
         assert!(validate(&too_many).is_err());
 
@@ -1845,19 +2392,43 @@ mod tests {
         assert!(validate(&long_label).is_err());
 
         let mut empty_id = base.clone();
-        empty_id.credentials[0].credential.credential_id.clear();
+        empty_id.credentials[0].factor = Factor::Fido2(fido_token::Credential {
+            rp_id: "fidostorers.local".to_string(),
+            credential_id: vec![],
+            device_hint: None,
+        });
         assert!(validate(&empty_id).is_err());
 
         let mut long_id = base.clone();
-        long_id.credentials[0].credential.credential_id = vec![0u8; MAX_CREDENTIAL_ID_LEN + 1];
+        long_id.credentials[0].factor = Factor::Fido2(fido_token::Credential {
+            rp_id: "fidostorers.local".to_string(),
+            credential_id: vec![0u8; MAX_CREDENTIAL_ID_LEN + 1],
+            device_hint: None,
+        });
         assert!(validate(&long_id).is_err());
+
+        let mut duplicate_ids = base.clone();
+        duplicate_ids.credentials = vec![base.credentials[0].clone(), base.credentials[0].clone()];
+        assert!(validate(&duplicate_ids).is_err());
+
+        let mut hostile_kdf = base.clone();
+        hostile_kdf.credentials[0].factor = Factor::Keyfile(crate::KeyfileParams {
+            m_cost_kib: u32::MAX,
+            t_cost: 1,
+            parallelism: 1,
+        });
+        assert!(validate(&hostile_kdf).is_err());
 
         let mut short_wrap = base.clone();
         short_wrap.credentials[0].wrapped_data_key = vec![0u8; 8];
         assert!(validate(&short_wrap).is_err());
 
         let mut mismatched_rp_id = base.clone();
-        mismatched_rp_id.credentials[0].credential.rp_id = "elsewhere.local".to_string();
+        mismatched_rp_id.credentials[0].factor = Factor::Fido2(fido_token::Credential {
+            rp_id: "elsewhere.local".to_string(),
+            credential_id: credential(1).credential_id,
+            device_hint: None,
+        });
         assert!(validate(&mismatched_rp_id).is_err());
     }
 

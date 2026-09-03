@@ -128,3 +128,6 @@ for now, and the `webauthn.dll` backend that would lift it is tabled as phase-2 
 5. [05-testing-strategy.md](05-testing-strategy.md) — unit tests, mock authenticator, hardware-in-the-loop tests
 6. [06-roadmap.md](06-roadmap.md) — phased milestones
 7. [07-open-decisions.md](07-open-decisions.md) — decision record: what was settled, and why
+8. [08-interactive-mode.md](08-interactive-mode.md) — long-lived sessions with cached keys (planned)
+9. [09-credential-encoding.md](09-credential-encoding.md) — hex credential IDs in CLI JSON (planned)
+10. [10-keyfile-password-auth.md](10-keyfile-password-auth.md) — keyfile + password as a second factor (planned)

@@ -159,6 +159,18 @@ The HKDF step between the two lives in this crate as `kek_from_secret`, not in
 part of the *vault format*, so it belongs beside the format that defines it, while
 the binary stays a pure orchestrator that never picks a crypto parameter of its own.
 
+## Planned: a second factor type
+
+[10-keyfile-password-auth.md](10-keyfile-password-auth.md) adds keyfile+password
+authentication. The seam described just above is what makes it cheap: because
+`unlock_with` already takes an *already-derived* KEK and `Vault` never talks to
+hardware, a second factor is a second way to produce 32 bytes and nothing below the
+KEK changes.
+
+Two signature changes fall out, both in that document: `unlock_with(credential_id, ..)`
+becomes `unlock_with(entry_id, ..)`, since a keyfile factor has no credential ID; and
+`Enrollment` carries a `Factor` rather than a `fido_token::Credential`.
+
 ## Crash safety
 
 Writes go to a temp file in the vault's directory then `rename()` into place

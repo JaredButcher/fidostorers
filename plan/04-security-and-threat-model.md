@@ -116,6 +116,56 @@ large file, so this is not the interesting attack.
   bounds-checked at parse time. A hostile length field must fail cleanly rather than
   drive a huge allocation.
 
+## Planned change: a second factor reintroduces the password
+
+[10-keyfile-password-auth.md](10-keyfile-password-auth.md) plans a keyfile+password
+factor, enrolled and revoked like a security key. It directly contradicts the second
+bullet under "What this protects against" above, and the contradiction is the point of
+this note:
+
+- **"Offline brute force: there is no password"** stops being true for any vault with
+  such a factor enrolled. An attacker holding both the vault file and the keyfile can
+  attack the password offline, bounded only by Argon2id's cost. That is an ordinary,
+  well-understood position — every password manager lives there — but it is a genuine
+  reduction from where this project started.
+- **A vault is only as strong as its weakest enrolled factor.** Every factor unwraps
+  the same data key, so enrolling a security key *and* a keyfile+password factor means
+  an attacker simply attacks whichever is cheaper. Adding this factor to a vault
+  lowers that vault's security, and `enroll` is specified to say so at the point of
+  use rather than leaving it in a document.
+- **The keyfile is what keeps the trade acceptable.** With a 32-byte random keyfile
+  stored somewhere other than the vault, an attacker holding only the vault file has
+  no password attack to mount — they are missing 256 bits they cannot guess. The
+  password becomes the binding constraint only once they have both, which is why the
+  two must not live together.
+
+Unchanged: tamper detection. Forging an entry still needs the data key, deleting or
+relabelling one is still caught by `header_mac`, and editing a salt or the KDF
+parameters still produces the wrong KEK and fails the wrap tag.
+
+## Planned change: interactive mode weakens two of the above
+
+[08-interactive-mode.md](08-interactive-mode.md) plans a long-lived session that keeps
+a vault's data key in memory, so a user touches their key once per vault instead of
+once per command. It reverses two things this document currently asserts, and the
+reversal is deliberate rather than an oversight:
+
+- **"Every unlocking operation needs a live touch"** and "there is no remember-me /
+  cached-secret mode" ([02-crate-fidostorers.md](02-crate-fidostorers.md)) stop being
+  true inside a session. A data key is held for as long as a store is open, bounded by
+  an idle timeout that defaults to 15 minutes
+  ([07-open-decisions.md](07-open-decisions.md) #18).
+- **Decrypted output on disk** stops being only "what the user explicitly asked to
+  write". Opening a `file` or `dir` store extracts it to a plaintext working directory
+  for the life of the session (#15). This is the larger of the two changes.
+
+What does *not* change: a vault at rest, with no session running, is exactly as
+protected as before. The weakened window is while a session is open.
+
+This section will be rewritten in place — not merely appended to — when interactive
+mode is implemented. Until then, the guarantees above this heading describe what the
+tool actually does today.
+
 ## Explicitly deferred (v2+ or "won't do")
 
 - Resident/discoverable credentials (would let `fidostorers` enumerate "which vaults

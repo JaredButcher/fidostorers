@@ -23,11 +23,12 @@ fn make_vault(path: &Path, mode: Mode) -> (Vault, Zeroizing<[u8; 32]>) {
         path,
         mode,
         &Enrollment {
-            credential: fido_token::Credential {
+            factor: fidostorers::Factor::Fido2(fido_token::Credential {
                 rp_id: "fidostorers.local".to_string(),
                 credential_id: CREDENTIAL_ID.to_vec(),
                 device_hint: None,
-            },
+            }),
+            rp_id: "fidostorers.local".to_string(),
             label: "primary".to_string(),
             salt: [7u8; 32],
             kek: Zeroizing::new(KEK),

@@ -14,11 +14,12 @@ fn make_vault(path: &std::path::Path) {
         path,
         Mode::File,
         &Enrollment {
-            credential: fido_token::Credential {
+            factor: fidostorers::Factor::Fido2(fido_token::Credential {
                 rp_id: "fidostorers.local".to_string(),
                 credential_id: vec![0xAB, 0xCD, 0xEF],
                 device_hint: None,
-            },
+            }),
+            rp_id: "fidostorers.local".to_string(),
             label: "primary".to_string(),
             salt: [3u8; 32],
             kek: Zeroizing::new([5u8; 32]),

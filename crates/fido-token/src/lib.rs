@@ -235,6 +235,61 @@ pub fn fingerprint(secret: &[u8]) -> String {
         .collect()
 }
 
+/// Render bytes as lowercase hex, no separators and no prefix.
+///
+/// Lives here, beside [`Credential`], because both binaries and the vault header's
+/// human-facing output all speak hex about the same values and should agree on the
+/// spelling.
+pub fn to_hex(bytes: &[u8]) -> String {
+    use fmt::Write as _;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            // Writing to a String is infallible.
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// Parse lowercase or uppercase hex with no separators.
+///
+/// Errors name the offending character and its offset: this parses user-supplied
+/// files and command-line arguments, so "invalid hex" alone would not be enough to
+/// find the typo.
+pub fn from_hex(input: &str) -> Result<Vec<u8>, HexError> {
+    if input.is_empty() {
+        return Err(HexError::Empty);
+    }
+    if input.len() % 2 != 0 {
+        return Err(HexError::OddLength(input.len()));
+    }
+    input
+        .as_bytes()
+        .chunks(2)
+        .enumerate()
+        .map(|(i, pair)| {
+            let text = std::str::from_utf8(pair).map_err(|_| HexError::InvalidChar {
+                offset: i * 2,
+                found: '?',
+            })?;
+            u8::from_str_radix(text, 16).map_err(|_| HexError::InvalidChar {
+                offset: i * 2,
+                found: text.chars().next().unwrap_or('?'),
+            })
+        })
+        .collect()
+}
+
+#[derive(thiserror::Error, Debug, PartialEq, Eq)]
+pub enum HexError {
+    #[error("expected hex digits, found nothing")]
+    Empty,
+    #[error("hex must have an even number of digits, found {0}")]
+    OddLength(usize),
+    #[error("invalid hex digit {found:?} at offset {offset}")]
+    InvalidChar { offset: usize, found: char },
+}
+
 /// Enumerate connected authenticators using the default (real hardware) backend.
 pub fn list_devices() -> Result<Vec<DeviceInfo>, TokenError> {
     HidAuthenticator::default().list_devices()
@@ -265,6 +320,35 @@ mod tests {
         assert_eq!(a, fingerprint(&[0u8; 32]));
         assert_ne!(a, fingerprint(&[1u8; 32]));
         assert_eq!(a.len(), 16, "8 bytes rendered as hex");
+    }
+
+    #[test]
+    fn hex_round_trips() {
+        for bytes in [vec![], vec![0u8], vec![0u8, 0x0F, 0xA5, 0xFF]] {
+            let text = to_hex(&bytes);
+            assert_eq!(text.len(), bytes.len() * 2);
+            if bytes.is_empty() {
+                assert_eq!(from_hex(&text), Err(HexError::Empty));
+            } else {
+                assert_eq!(from_hex(&text).unwrap(), bytes);
+            }
+        }
+        assert_eq!(to_hex(&[0xAB, 0xCD]), "abcd");
+        // Uppercase is accepted on the way in, even though we never emit it.
+        assert_eq!(from_hex("ABCD").unwrap(), vec![0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn hex_errors_locate_the_problem() {
+        assert_eq!(from_hex(""), Err(HexError::Empty));
+        assert_eq!(from_hex("abc"), Err(HexError::OddLength(3)));
+        assert_eq!(
+            from_hex("abzz"),
+            Err(HexError::InvalidChar {
+                offset: 2,
+                found: 'z'
+            })
+        );
     }
 
     #[test]

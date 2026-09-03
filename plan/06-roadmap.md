@@ -232,6 +232,104 @@ Everything else in the direct dependency set is current and actively maintained:
 `chacha20poly1305`, `hkdf`, `hmac`, `sha2` (RustCrypto), `postcard`, `tar`, `tempfile`,
 `zeroize`, `clap`, `anyhow`, `thiserror`, `rand`, `serde`, and `proptest` (dev-only).
 
+## M7 — Credential JSON hex encoding
+
+**Done.**
+
+- [x] `CredentialJson` DTO in the `fido-token` CLI; `credential_id` emitted as a hex
+  string, with the byte-array form still accepted on read.
+- [x] Shared hex helpers in `fido-token`'s library, replacing the copies that were
+  duplicated in both binaries.
+- [x] A test asserting the vault header still stores credential IDs as raw bytes, not
+  hex — the regression that would have mattered most.
+- [x] Sample output added to [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md).
+
+Full detail: [09-credential-encoding.md](09-credential-encoding.md).
+
+## M8 — Keyfile + password authentication
+
+**Done.** Sequenced before interactive mode on purpose: it changes the header layout
+to `FORMAT_VERSION` 2 and changes `Vault::unlock_with` from a credential ID to an entry
+ID, and doing that underneath a finished session implementation would have meant
+revising it twice.
+
+- [x] `Factor` enum in the header (`Fido2` | `Keyfile`), per-entry random 16-byte `id`,
+  `FORMAT_VERSION` 2, with v1 vaults still readable and silently rewritten as v2.
+- [x] `Argon2id(password, salt = entry salt, secret = SHA-256(keyfile))` -> HKDF -> KEK,
+  with cost parameters stored per entry and **bounds-checked at parse time**.
+- [x] `fidostorers keyfile new`; enroll-time warnings for a keyfile that looks fragile
+  (plain text, inside a git repo or a sync folder, very large).
+- [x] `--auth keyfile --keyfile <path>` on `init`/`enroll`, `--keyfile` on every
+  unlocking command, `revoke --id <hex>` with `--credential` kept as an alias.
+- [x] Password prompted with no echo, never in `argv`; `--password-stdin` for scripting.
+- [x] An end-to-end unlock path CI can run, since this factor needs no hardware.
+- [ ] Manual check that a **mixed** vault (one security key, one keyfile factor) opens
+  by either route — the one part still needing hardware.
+
+### Refinements made while implementing
+
+1. **`Enrollment` carries an explicit `rp_id`.** A keyfile factor has no authenticator
+   and therefore no relying party of its own, so the value cannot be inferred from the
+   factor the way it could when every entry was a FIDO2 credential. A FIDO2 credential
+   that disagrees with the vault is still rejected.
+2. **`enroll` and `revoke` use `--unlock-*` flags** for the factor doing the unlocking.
+   Both commands have to name two different things — the factor being added or removed,
+   and the one authorising it — and a single `--keyfile`/`--id` cannot mean both.
+3. **`enroll --password-stdin` reads the new factor's password**, with
+   `--unlock-password-stdin` reading the unlocking one first, so a two-factor enroll is
+   scriptable.
+4. **Duplicate detection only applies to FIDO2 factors.** Two keyfile factors over the
+   same file and password are legitimate (different salts, different labels) and are
+   indistinguishable from the header without the password, so there is nothing to check.
+
+Full detail, including why both factors are required and what this costs the threat
+model: [10-keyfile-password-auth.md](10-keyfile-password-auth.md).
+
+## M9 — Interactive session core
+
+The session, without working directories — so `kv` stores work end to end and no
+plaintext reaches disk in this milestone. That ordering keeps the riskiest part (M9)
+out of the first working version.
+
+- `fidostorers interactive`: REPL over the existing `clap` command definitions,
+  `rustyline` for line editing, **memory-only history** (a persisted history file
+  would capture `kv set --value <secret>`).
+- Any number of open stores, each holding only its data key; aliases from file stems.
+- `open`, `close`, `stores`, `seal`, `info`, `kv *`, `enroll`, `revoke`, `exit`.
+- Idle timeout with an injectable clock, default 15 minutes.
+- Graceful shutdown on `exit`, EOF, Ctrl+C, `SIGTERM`, `SIGHUP`, with signals during a
+  write deferred rather than aborting it.
+- Advisory `<vault>.lock`, honoured by the one-shot commands too.
+- Ctrl+D (or `exit`) shuts down gracefully; Ctrl+C cancels the current line or
+  operation, and interrupts a shutdown that is taking too long
+  ([07-open-decisions.md](07-open-decisions.md) #19).
+
+## M10 — Working directories for `file` and `dir` stores
+
+The part that puts plaintext on disk, and the reason it is its own milestone.
+
+- Extraction on `open` to `$XDG_RUNTIME_DIR`/temp, mode `0700`, never beside the vault
+  by default; `--work-dir` with a warning when the destination looks like a git repo
+  or a sync folder.
+- Manifest-based dirty tracking, so an unchanged store is not rewritten on exit.
+- Idle-timeout expiry performs a full close, and counts working-directory
+  modifications as activity.
+- Orphan recovery: a session file, dead-pid detection at startup, and a per-store
+  seal/discard/leave prompt.
+- Honest documentation that cleanup is unlinking, not secure erasure.
+
+## M11 — Hardening to match the longer key lifetime
+
+Promoted out of phase 2 by M9/M10: a data key held for a single command is unlikely to
+be swapped out, but one held for an hour is a different proposition.
+
+- `mlock`/`VirtualLock` pinning for data keys.
+- Core-dump suppression, so a crash dump of a session process cannot contain every
+  open store's data key.
+
+Interactive mode should not be recommended for real use, and the docs should not
+describe a session as safe, until these land.
+
 ## Phase 2 (explicitly deferred, not committed)
 - **Direct `webauthn.dll` backend for Windows**, to remove the Administrator
   requirement M1 hardware testing confirmed (findings above,
@@ -247,4 +345,8 @@ Everything else in the direct dependency set is current and actively maintained:
   lower-assurance and needs its own scrutiny before shipping).
 - Resident/discoverable credential support.
 - NFC/BLE transports.
-- `mlock`/`VirtualLock` memory pinning hardening.
+- `mlock`/`VirtualLock` memory pinning hardening. **Promoted to M11** if interactive
+  mode is built, since that is what makes it load-bearing rather than nice to have.
+- A true `--rekey` for `revoke` (new data key, payload re-encrypted, every surviving
+  credential re-wrapped), which needs every remaining key physically present. See M5's
+  finding above.

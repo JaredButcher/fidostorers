@@ -8,10 +8,12 @@
 mod archive;
 mod crypto;
 mod error;
+pub mod keyfile;
 mod kv;
 mod vault;
 
 pub use archive::{ExtractReport, SkippedEntry};
 pub use crypto::kek_from_secret;
 pub use error::VaultError;
-pub use vault::{CredentialEntry, Enrollment, Mode, Vault, FORMAT_VERSION};
+pub use keyfile::KeyfileParams;
+pub use vault::{Enrollment, Factor, FactorEntry, Mode, Vault, FORMAT_VERSION};

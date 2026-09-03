@@ -27,6 +27,11 @@ const KEK_INFO: &[u8] = b"fidostorers-kek-v1";
 /// header).
 const HEADER_MAC_INFO: &[u8] = b"fidostorers-header-mac-v1";
 
+/// Domain separator for a KEK derived from a keyfile + password rather than from a
+/// security key. Distinct from [`KEK_INFO`] so the two factor types can never derive
+/// the same KEK from coincidentally equal inputs.
+const KEK_KEYFILE_INFO: &[u8] = b"fidostorers-kek-keyfile-v1";
+
 /// Turn the 32-byte `hmac-secret` output for a (credential, salt) pair into that
 /// credential's KEK.
 ///
@@ -35,6 +40,11 @@ const HEADER_MAC_INFO: &[u8] = b"fidostorers-header-mac-v1";
 /// to [`crate::Vault`], which never touches hardware itself.
 pub fn kek_from_secret(secret: &[u8; 32]) -> Zeroizing<[u8; 32]> {
     hkdf_32(secret, KEK_INFO)
+}
+
+/// Final step of the keyfile factor's derivation; see [`crate::keyfile`].
+pub(crate) fn kek_from_keyfile_secret(argon_out: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    hkdf_32(argon_out, KEK_KEYFILE_INFO)
 }
 
 pub(crate) fn mac_key_from_data_key(data_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
@@ -118,8 +128,13 @@ mod tests {
         assert_ne!(*kek_from_secret(&secret), *kek_from_secret(&[8u8; 32]));
         // The KEK must not be the raw authenticator output.
         assert_ne!(*kek_from_secret(&secret), secret);
-        // And the two derivations off one input must differ from each other.
+        // And the derivations off one input must all differ from each other.
         assert_ne!(*kek_from_secret(&secret), *mac_key_from_data_key(&secret));
+        assert_ne!(*kek_from_secret(&secret), *kek_from_keyfile_secret(&secret));
+        assert_ne!(
+            *kek_from_keyfile_secret(&secret),
+            *mac_key_from_data_key(&secret)
+        );
     }
 
     #[test]

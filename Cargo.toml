@@ -23,6 +23,9 @@ hmac = "0.12"
 sha2 = "0.10"
 hkdf = "0.12"
 chacha20poly1305 = "0.10"
+# Argon2id for the keyfile+password factor. Memory-hard, because that factor is
+# the only one an attacker can grind offline. See plan/10-keyfile-password-auth.md.
+argon2 = "0.5"
 # `use-std` gives the alloc-backed (de)serializers; the default feature set is
 # heapless-oriented and has no `to_stdvec`.
 postcard = { version = "1", default-features = false, features = ["use-std"] }

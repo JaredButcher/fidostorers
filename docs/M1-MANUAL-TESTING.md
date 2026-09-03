@@ -235,7 +235,19 @@ for encrypting anything.
 cargo run -p fido-token -- selftest > first.txt
 ```
 
-Save the credential JSON from the last line of that output as `cred.json`. Then
+Save the credential JSON from the last line of that output as `cred.json`. It looks
+like this — `credential_id` is lowercase hex (it was a byte array before M7; old files
+saved in that form still load):
+
+```json
+{
+  "rp_id": "fidostorers.local",
+  "credential_id": "a1b2c3d46016084f...",
+  "device_hint": "YubiKey 5 NFC"
+}
+```
+
+Then
 **unplug the key, plug it back in** (a full reboot is a stronger version of this
 test), and:
 

@@ -14,6 +14,7 @@ use clap::{Args, Parser, Subcommand};
 use fido_token::{
     Credential, DeriveOptions, PinProvider, RegisterOptions, TokenError, DEFAULT_RP_ID,
 };
+use serde::{Deserialize, Serialize};
 
 /// Exit codes, so scripts (and crate 2's CLI) can distinguish outcomes without
 /// parsing messages. See plan/01-crate-fido-token.md.
@@ -189,7 +190,7 @@ fn run(command: Commands) -> Result<()> {
                 timeout: Duration::from_secs(timeout),
                 pin_provider: pin_provider(no_pin),
             })?;
-            println!("{}", serde_json::to_string_pretty(&credential)?);
+            print_credential(&credential)?;
             Ok(())
         }
         Commands::Derive {
@@ -392,10 +393,90 @@ fn pin_provider(no_pin: bool) -> Option<PinProvider> {
     fido_token::terminal_pin_provider()
 }
 
+/// How a credential is written to and read from JSON by this CLI.
+///
+/// Deliberately separate from [`Credential`], whose serde impl also defines the vault
+/// header's on-disk layout (plan/03) and therefore must not move. Serde attributes
+/// are per-type rather than per-format, so encoding `credential_id` as hex on the
+/// library type would silently change the vault format too. See
+/// plan/09-credential-encoding.md and plan/07 #17.
+#[derive(Serialize, Deserialize)]
+struct CredentialJson {
+    rp_id: String,
+    /// Lowercase hex, no separators, no `0x` prefix.
+    credential_id: CredentialIdJson,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device_hint: Option<String>,
+}
+
+/// Accepts either spelling on the way in, and only ever writes the hex one.
+///
+/// The array form is what this CLI emitted before M7. Credential files already exist
+/// on disk — docs/M1-MANUAL-TESTING.md has readers saving `cred.json` and reusing it
+/// after a replug — and silently breaking them for a cosmetic change would be a poor
+/// trade. Delete the `Bytes` variant once no such file is worth keeping.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum CredentialIdJson {
+    Hex(String),
+    Bytes(Vec<u8>),
+}
+
+impl From<&Credential> for CredentialJson {
+    fn from(credential: &Credential) -> Self {
+        Self {
+            rp_id: credential.rp_id.clone(),
+            credential_id: CredentialIdJson::Hex(fido_token::to_hex(&credential.credential_id)),
+            device_hint: credential.device_hint.clone(),
+        }
+    }
+}
+
+impl TryFrom<CredentialJson> for Credential {
+    type Error = anyhow::Error;
+
+    fn try_from(json: CredentialJson) -> Result<Self> {
+        let credential_id = match json.credential_id {
+            CredentialIdJson::Hex(text) => {
+                fido_token::from_hex(&text).context("credential_id is not valid hex")?
+            }
+            CredentialIdJson::Bytes(bytes) => bytes,
+        };
+        if credential_id.is_empty() {
+            anyhow::bail!("credential_id must not be empty");
+        }
+        // Agree with the bound the vault header parser enforces, so a credential this
+        // CLI accepts can always be enrolled.
+        if credential_id.len() > MAX_CREDENTIAL_ID_LEN {
+            anyhow::bail!(
+                "credential_id is {} bytes, over the {MAX_CREDENTIAL_ID_LEN}-byte limit",
+                credential_id.len()
+            );
+        }
+        Ok(Credential {
+            rp_id: json.rp_id,
+            credential_id,
+            device_hint: json.device_hint,
+        })
+    }
+}
+
+/// Matches `MAX_CREDENTIAL_ID_LEN` in the vault header parser (plan/03).
+const MAX_CREDENTIAL_ID_LEN: usize = 1024;
+
+fn print_credential(credential: &Credential) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&CredentialJson::from(credential))?
+    );
+    Ok(())
+}
+
 fn load_credential(path: &PathBuf) -> Result<Credential> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading credential file {}", path.display()))?;
-    serde_json::from_str(&raw).context("parsing credential JSON")
+    let json: CredentialJson = serde_json::from_str(&raw).context("parsing credential JSON")?;
+    json.try_into()
 }
 
 /// Map a failure onto a stable exit code. Anything that isn't a `TokenError`
@@ -426,25 +507,103 @@ fn parse_salt(input: &str) -> Result<[u8; 32]> {
     Ok(salt)
 }
 
+/// Thin wrappers so this binary's errors stay `anyhow`. The encoding itself lives in
+/// the library beside `Credential`, so both binaries and the JSON DTO agree.
 fn from_hex(input: &str) -> Result<Vec<u8>> {
-    if input.len() % 2 != 0 {
-        anyhow::bail!("hex string must have an even number of characters");
-    }
-    (0..input.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&input[i..i + 2], 16)
-                .with_context(|| format!("invalid hex byte at offset {i}"))
-        })
-        .collect()
+    Ok(fido_token::from_hex(input)?)
 }
 
 fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    fido_token::to_hex(bytes)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{Credential, CredentialJson};
+
+    fn sample() -> Credential {
+        Credential {
+            rp_id: "fidostorers.local".to_string(),
+            credential_id: vec![0xA1, 0xB2, 0xC3, 0xD4, 0x60, 0x16, 0x08, 0x4F],
+            device_hint: Some("YubiKey 5 NFC".to_string()),
+        }
+    }
+
+    #[test]
+    fn credential_json_round_trips() {
+        let original = sample();
+        let text = serde_json::to_string(&CredentialJson::from(&original)).unwrap();
+        let parsed: CredentialJson = serde_json::from_str(&text).unwrap();
+        assert_eq!(Credential::try_from(parsed).unwrap(), original);
+    }
+
+    #[test]
+    fn credential_id_is_emitted_as_a_hex_string() {
+        // Pinned against a literal so a future serde change cannot quietly alter the
+        // format that users' saved credential files depend on.
+        let text = serde_json::to_string(&CredentialJson::from(&sample())).unwrap();
+        assert!(
+            text.contains(r#""credential_id":"a1b2c3d46016084f""#),
+            "{text}"
+        );
+        assert!(
+            !text.contains('['),
+            "the byte-array form is still being written: {text}"
+        );
+    }
+
+    #[test]
+    fn the_old_byte_array_form_still_loads() {
+        // A cred.json saved before M7 must keep working; see plan/09.
+        let old = r#"{
+            "rp_id": "fidostorers.local",
+            "credential_id": [161, 178, 195, 212, 96, 22, 8, 79],
+            "device_hint": "YubiKey 5 NFC"
+        }"#;
+        let parsed: CredentialJson = serde_json::from_str(old).unwrap();
+        assert_eq!(Credential::try_from(parsed).unwrap(), sample());
+    }
+
+    #[test]
+    fn a_missing_device_hint_round_trips_as_absent() {
+        let mut credential = sample();
+        credential.device_hint = None;
+        let text = serde_json::to_string(&CredentialJson::from(&credential)).unwrap();
+        assert!(!text.contains("device_hint"), "{text}");
+        let parsed: CredentialJson = serde_json::from_str(&text).unwrap();
+        assert_eq!(Credential::try_from(parsed).unwrap(), credential);
+    }
+
+    #[test]
+    fn malformed_credential_ids_are_rejected_with_a_reason() {
+        let cases = [
+            (r#"{"rp_id":"x","credential_id":"abc"}"#, "even number"),
+            (
+                r#"{"rp_id":"x","credential_id":"abzz"}"#,
+                "invalid hex digit",
+            ),
+            (r#"{"rp_id":"x","credential_id":""}"#, "found nothing"),
+        ];
+        for (json, expected) in cases {
+            let parsed: CredentialJson = serde_json::from_str(json).unwrap();
+            let err = Credential::try_from(parsed).unwrap_err();
+            let text = format!("{err:#}");
+            assert!(text.contains(expected), "{json} -> {text}");
+        }
+    }
+
+    #[test]
+    fn an_oversized_credential_id_is_rejected() {
+        // Agrees with the vault header's own cap, so anything this CLI accepts can
+        // actually be enrolled.
+        let json = format!(
+            r#"{{"rp_id":"x","credential_id":"{}"}}"#,
+            "ab".repeat(super::MAX_CREDENTIAL_ID_LEN + 1)
+        );
+        let parsed: CredentialJson = serde_json::from_str(&json).unwrap();
+        assert!(Credential::try_from(parsed).is_err());
+    }
+
     use super::*;
     use clap::CommandFactory;
 

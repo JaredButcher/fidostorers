@@ -38,11 +38,36 @@ security key ──(touch)──► hmac-secret ──HKDF──► KEK ──un
 Full design notes are in [`plan/`](plan/); the on-disk format is
 [`plan/03-vault-format-and-crypto.md`](plan/03-vault-format-and-crypto.md).
 
-## Requirements
+## Two ways to unlock
 
-A CTAP2 security key that implements `hmac-secret` — YubiKey 5 series, SoloKey,
-Nitrokey 3, Token2 and similar. **U2F-only keys cannot work** and will be rejected
-with a clear error.
+**A security key** is the stronger option and the reason this project exists: the
+secret cannot be copied off the device, and every unlock needs a physical touch.
+Requires a CTAP2 key implementing `hmac-secret` — YubiKey 5 series, SoloKey,
+Nitrokey 3, Token2 and similar. **U2F-only keys cannot work** and are rejected with a
+clear error.
+
+**A keyfile plus a password** needs no hardware. Both are required, always: a keyfile
+alone would be a copyable bearer token, and a password alone is exactly the
+offline-guessable secret this tool exists to avoid. The two are combined with Argon2id.
+
+```sh
+fidostorers keyfile new ~/secrets/vault.key
+fidostorers init vault.fido --mode kv --auth keyfile --keyfile ~/secrets/vault.key
+```
+
+> **A vault is only as strong as its weakest enrolled factor.** Any one factor opens
+> it, so adding a keyfile+password factor to a vault that has a security key *lowers*
+> that vault's security — an attacker will go after the password. For the strongest
+> setup, enroll only hardware keys.
+>
+> What keeps the keyfile factor respectable is the keyfile itself. With 32 random
+> bytes stored somewhere the vault is not, an attacker holding only the vault file has
+> nothing to attack. Store them together and you are back to guessing a password.
+>
+> The keyfile must stay **byte-identical forever**. An editor adding a trailing
+> newline, a Windows/Linux copy translating line endings, or a sync service
+> "optimising" an image will silently make the vault unopenable. This is why
+> `keyfile new` writes random binary rather than letting you point at a photo.
 
 ## Install
 
@@ -121,6 +146,11 @@ fidostorers kv ls  tokens.fido
 fidostorers kv rm  tokens.fido github
 ```
 
+Add `--keyfile <path>` to any of these to unlock with a keyfile factor instead of a
+security key; the password is prompted for, or read from stdin with
+`--password-stdin`. There is deliberately no `--password` flag — a password in the
+command line lands in shell history and is visible to every other process.
+
 Prefer `--stdin` or `--file` over `--value`: a value on the command line is visible in
 your shell history and to other processes on the machine.
 
@@ -128,15 +158,32 @@ Each `kv set`/`kv rm` re-encrypts and rewrites the whole vault. That keeps the f
 simple and is fine for hundreds of small secrets; it is not built for hundreds of
 thousands.
 
-## Multiple keys
+## Multiple factors
 
-Any enrolled key opens the vault. Enroll at least two.
+Any enrolled factor opens the vault. Enroll at least two.
 
 ```sh
 fidostorers enroll my.fido --label "backup in safe"
+
+# ...or add a keyfile factor, unlocking with a key you already have enrolled
+fidostorers enroll my.fido --auth keyfile --keyfile /media/usb/vault.key \
+                           --label "usb backup"
+
 fidostorers info my.fido
-fidostorers revoke my.fido --credential <hex-id-from-info>
+fidostorers revoke my.fido --id <hex-id-from-info>
 ```
+
+`info` lists each factor's id, kind, and label:
+
+```
+enrolled factors:
+  a346e8d266fc8aabf81dd91835b407e1  keyfile  primary
+  b142a0eb29a19ceedc320d9f30779ca4  fido2    backup in safe
+```
+
+Commands that both name a factor *and* unlock the vault (`enroll`, `revoke`) use
+`--unlock-keyfile` / `--unlock-id` for the factor doing the unlocking, since a single
+`--keyfile` cannot mean both.
 
 `info` needs no touch, so its output is **unauthenticated** — it is labelled as such,
 and nothing security-relevant should be decided from it.
@@ -159,7 +206,7 @@ file behaves the same way.)
 | | |
 |---|---|
 | Stolen laptop, leaked backup, cloud-sync breach | ✅ The file holds no secret material. |
-| Offline password guessing | ✅ There is no password. |
+| Offline password guessing | ✅ with security keys only — there is no password. ⚠️ A keyfile+password factor reintroduces it: someone with both the vault *and* the keyfile can attack the password offline, bounded by Argon2id. |
 | Malware reading the vault while the key is unplugged | ✅ |
 | Malware running *while you touch the key* | ❌ It can read what you just decrypted. |
 | Backdoored security-key firmware | ❌ Out of scope; trust your hardware. |
