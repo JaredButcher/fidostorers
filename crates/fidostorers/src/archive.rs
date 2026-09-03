@@ -107,6 +107,14 @@ pub(crate) fn build(root: &Path) -> Result<Vec<u8>, VaultError> {
     builder.into_inner().map_err(VaultError::Io)
 }
 
+/// A valid, empty tar stream — the payload a freshly created `dir` vault holds
+/// before anything is sealed into it.
+pub(crate) fn empty() -> Result<Vec<u8>, VaultError> {
+    tar::Builder::new(Vec::new())
+        .into_inner()
+        .map_err(VaultError::Io)
+}
+
 fn sort_key(path: &Path) -> String {
     path.components()
         .map(|c| c.as_os_str().to_string_lossy().into_owned())

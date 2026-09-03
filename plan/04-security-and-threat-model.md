@@ -69,11 +69,14 @@ large file, so this is not the interesting attack.
   (`rpassword` crate) and never written to disk, logs, or shell history. They are
   passed straight to `fido-token`'s register/derive calls and dropped immediately
   after.
-- Decrypted output written to disk (`unlock`, `kv get --file`) is, unavoidably,
-  plaintext on disk from that point on — that's the user's explicit request (they
-  asked to decrypt to a path) and outside this tool's control once written; `kv get`
-  without `--file` writes to stdout instead, and callers wanting to avoid touching
-  disk should redirect stdout to another process rather than using `--file`.
+- Decrypted output written to disk (`unlock`) is, unavoidably, plaintext on disk
+  from that point on — that's the user's explicit request (they asked to decrypt to a
+  path) and outside this tool's control once written.
+- `kv get` writes raw bytes to **stdout only**; the `--file` variant this section
+  once described was deliberately not built (M4). Redirecting stdout to another
+  process never puts the value on disk, and offering a `--file` shortcut would have
+  made the less safe option the more convenient one. Callers who do want it on disk
+  can redirect to a file themselves, which at least makes the choice explicit.
 
 ## Downgrade/tampering resistance
 

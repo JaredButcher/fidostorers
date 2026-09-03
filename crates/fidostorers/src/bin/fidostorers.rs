@@ -1,16 +1,16 @@
 //! `fidostorers` CLI. See plan/02-crate-fidostorers.md.
 //!
-//! `init`, `lock`, `unlock`, and `info` are wired end to end for file mode (M2) and
-//! directory mode (M3). `enroll`/`revoke` (M5) and kv mode (M4) still bottom out in
-//! `NotImplemented` — see plan/06-roadmap.md.
+//! `init`, `lock`, `unlock`, `kv`, and `info` are wired end to end for all three
+//! modes (M2–M4). `enroll`/`revoke` (M5) still bottom out in `NotImplemented` — see
+//! plan/06-roadmap.md.
 //!
 //! This binary is where the two halves meet: it asks `fido-token` for an
 //! `hmac-secret` output, runs it through `fidostorers::kek_from_secret`, and hands
 //! the resulting KEK to `Vault`. The library never talks to hardware itself
 //! (plan/02-crate-fidostorers.md), so this orchestration lives here and only here.
 
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -94,17 +94,25 @@ enum KvCommands {
         name: String,
         #[command(flatten)]
         source: KvValueSource,
+        #[arg(long)]
+        require_uv: bool,
     },
     Get {
         vault: PathBuf,
         name: String,
+        #[arg(long)]
+        require_uv: bool,
     },
     Rm {
         vault: PathBuf,
         name: String,
+        #[arg(long)]
+        require_uv: bool,
     },
     Ls {
         vault: PathBuf,
+        #[arg(long)]
+        require_uv: bool,
     },
 }
 
@@ -201,13 +209,23 @@ fn unlock_vault(vault: &Vault, require_uv: bool) -> Result<Zeroizing<[u8; 32]>> 
     }
 }
 
-/// `lock`/`unlock` know file and dir mode; kv is M4, and is reached through the
-/// `kv` subcommand rather than these two anyway.
-fn not_yet_supported(mode: Mode) -> anyhow::Error {
-    anyhow::anyhow!(
-        "this is a {mode} vault; use `fidostorers kv` for it — kv mode lands in M4, \
-         see plan/06-roadmap.md"
-    )
+/// `lock`/`unlock` handle file and dir vaults; a kv vault is managed entry by entry
+/// through the `kv` subcommand instead.
+fn wrong_command_for_mode(mode: Mode) -> anyhow::Error {
+    anyhow::anyhow!("this is a {mode} vault; use `fidostorers kv` to manage its entries")
+}
+
+/// Open a vault and confirm it is a kv vault before asking for a touch — telling
+/// someone they used the wrong subcommand should not cost them a key press.
+fn open_kv_vault(path: &Path) -> Result<Vault> {
+    let vault = Vault::open(path)?;
+    if vault.mode() != Mode::Kv {
+        bail!(
+            "this is a {} vault; `kv` only works on kv vaults (use `lock`/`unlock`)",
+            vault.mode()
+        );
+    }
+    Ok(vault)
 }
 
 fn run() -> Result<i32> {
@@ -277,7 +295,7 @@ fn run() -> Result<i32> {
                     vault.seal_dir(&data_key, &input)?;
                     println!("locked the tree at {input:?} into {path:?}");
                 }
-                mode => return Err(not_yet_supported(mode)),
+                mode => return Err(wrong_command_for_mode(mode)),
             }
         }
         Commands::Unlock {
@@ -329,30 +347,58 @@ fn run() -> Result<i32> {
                         return Ok(EXIT_INCOMPLETE_EXTRACTION);
                     }
                 }
-                mode => return Err(not_yet_supported(mode)),
+                mode => return Err(wrong_command_for_mode(mode)),
             }
         }
         Commands::Kv { command } => match command {
             KvCommands::Set {
-                vault,
+                vault: path,
                 name,
                 source,
+                require_uv,
             } => {
-                let value = source.resolve()?;
-                let _ = (Vault::open(&vault)?, name, value);
-                bail!("kv support lands in M4, see plan/06-roadmap.md");
+                // Read the value before touching the key, so a bad --file path fails
+                // immediately instead of after the user has already touched.
+                let value = Zeroizing::new(source.resolve()?);
+                let mut vault = open_kv_vault(&path)?;
+                let data_key = unlock_vault(&vault, require_uv)?;
+                vault.kv_set(&data_key, &name, &value)?;
+                println!("set {name:?} in {path:?}");
             }
-            KvCommands::Get { vault, name } => {
-                let _ = (Vault::open(&vault)?, name);
-                bail!("kv support lands in M4, see plan/06-roadmap.md");
+            KvCommands::Get {
+                vault: path,
+                name,
+                require_uv,
+            } => {
+                let vault = open_kv_vault(&path)?;
+                let data_key = unlock_vault(&vault, require_uv)?;
+                let value = vault.kv_get(&data_key, &name)?;
+                // Raw bytes, no trailing newline: values may be binary, and a
+                // caller piping this into another process must get exactly what
+                // was stored.
+                std::io::stdout()
+                    .write_all(&value)
+                    .context("writing the value to stdout")?;
             }
-            KvCommands::Rm { vault, name } => {
-                let _ = (Vault::open(&vault)?, name);
-                bail!("kv support lands in M4, see plan/06-roadmap.md");
+            KvCommands::Rm {
+                vault: path,
+                name,
+                require_uv,
+            } => {
+                let mut vault = open_kv_vault(&path)?;
+                let data_key = unlock_vault(&vault, require_uv)?;
+                vault.kv_rm(&data_key, &name)?;
+                println!("removed {name:?} from {path:?}");
             }
-            KvCommands::Ls { vault } => {
-                let _ = Vault::open(&vault)?;
-                bail!("kv support lands in M4, see plan/06-roadmap.md");
+            KvCommands::Ls {
+                vault: path,
+                require_uv,
+            } => {
+                let vault = open_kv_vault(&path)?;
+                let data_key = unlock_vault(&vault, require_uv)?;
+                for name in vault.kv_ls(&data_key)? {
+                    println!("{name}");
+                }
             }
         },
         Commands::Info { vault } => {

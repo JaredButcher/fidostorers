@@ -35,6 +35,15 @@ pub enum VaultError {
     #[error("malformed archive: {0}")]
     MalformedArchive(String),
 
+    #[error("malformed payload: {0}")]
+    MalformedPayload(String),
+
+    #[error("no entry named {0:?} in this vault")]
+    NoSuchEntry(String),
+
+    #[error("invalid entry name: {0}")]
+    InvalidEntryName(String),
+
     #[error("refusing to extract an unsafe archive path: {0}")]
     UnsafeArchivePath(String),
 

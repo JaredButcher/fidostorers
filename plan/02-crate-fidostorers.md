@@ -47,6 +47,10 @@ fidostorers kv get <vault> <name>
 fidostorers kv rm <vault> <name>
 fidostorers kv ls <vault>
     (mode = kv only) Touch an enrolled key once per invocation; manage entries.
+    `get` writes the raw value to stdout with no trailing newline, so binary values
+    survive a pipe. `rm` errors on a name that is not there, so a typo cannot look
+    like a successful deletion. The mode check happens before the touch: being told
+    you used the wrong subcommand should not cost a key press.
 
 fidostorers info <vault>
     Show mode, enrolled credential count/labels, format version — no touch required
@@ -78,8 +82,9 @@ silent success. Every skipped entry is named on stderr with its reason before it
 
 ## KV mode trade-off (documented, not hidden)
 
-Storing every KV entry inside one AEAD-encrypted blob means any single `kv set` or
-`kv rm` re-encrypts and rewrites the entire vault file. For the target use case (a
+**Implemented in M4 exactly as described here.** Storing every KV entry inside one
+AEAD-encrypted blob means any single `kv set` or `kv rm` re-encrypts and rewrites the
+entire vault file. For the target use case (a
 handful to a few hundred small secrets — API tokens, recovery codes, etc.) this is
 fine and keeps the format simple (one ciphertext, one nonce, one AEAD tag — no
 per-entry nonce management to get wrong). If usage ever demands large numbers of

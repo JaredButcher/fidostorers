@@ -126,8 +126,29 @@ did not survive contact, all recorded there in full:
    [04-security-and-threat-model.md](04-security-and-threat-model.md).
 
 ## M4 — KV mode
-- `kv set/get/rm/ls`.
-- Property tests for KV round trips.
+
+**Code: done. Hardware validation: outstanding.**
+
+- [x] `kv set/get/rm/ls`, each rewriting the whole vault (the documented trade-off in
+  [02-crate-fidostorers.md](02-crate-fidostorers.md)).
+- [x] Property tests for KV round trips, and for directory round trips while there —
+  arbitrary entry names and values, arbitrary small trees with colliding shapes.
+- [ ] End-to-end manual test against real hardware, one touch per invocation.
+
+### Refinement made while implementing
+
+**A newly created vault now holds a payload that is valid for its mode**, rather than
+zero bytes: an empty tar for `dir`, an encoded empty map for `kv`. Before this,
+`kv ls` (or `unlock`) on a vault nothing had been sealed into yet would have tried to
+parse an empty payload. The invariant is worth stating plainly: *a vault's payload is
+always a well-formed encoding of its mode*, from `init` onward.
+
+`kv get --file`, mentioned in passing in
+[04-security-and-threat-model.md](04-security-and-threat-model.md), was **not** built.
+`get` writes raw bytes to stdout with no trailing newline, which is both the CLI
+spec in [02-crate-fidostorers.md](02-crate-fidostorers.md) and the option that doc
+itself prefers — redirecting stdout to another process never puts the plaintext on
+disk at all.
 
 ## M5 — Multi-key enrollment & revocation
 - `enroll`, `revoke` across all three modes.

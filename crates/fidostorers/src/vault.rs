@@ -39,6 +39,7 @@ use zeroize::Zeroizing;
 
 use crate::archive::{self, ExtractReport};
 use crate::crypto;
+use crate::kv::KvMap;
 use crate::VaultError;
 
 /// Format version written by this build. Bumped whenever the on-disk layout
@@ -164,15 +165,19 @@ impl Vault {
         let data_key = crypto::random_key();
         let entry = wrap_for(enrollment, &data_key)?;
 
+        // A new vault's payload must already be a valid encoding for its mode, so
+        // that `unlock`/`kv ls` on a vault nothing has been sealed into yet reads an
+        // empty tree or an empty store rather than failing to parse zero bytes.
+        let initial = Zeroizing::new(empty_payload(mode)?);
         let payload_nonce = crypto::random_nonce();
-        let payload = crypto::seal(&data_key, &payload_nonce, &[])?;
+        let payload = crypto::seal(&data_key, &payload_nonce, &initial)?;
 
         let body = HeaderBody {
             mode,
             rp_id: enrollment.credential.rp_id.clone(),
             credentials: vec![entry],
             payload_nonce,
-            payload_len: 0,
+            payload_len: initial.len() as u64,
         };
 
         let mut vault = Vault {
@@ -515,16 +520,20 @@ impl Vault {
     }
 
     /// (mode = Kv) Set (inserting or overwriting) one entry.
+    ///
+    /// Rewrites the whole vault: the store is one AEAD-sealed blob, so there is no
+    /// such thing as touching a single entry on disk. See the trade-off note in
+    /// plan/02-crate-fidostorers.md.
     pub fn kv_set(
         &mut self,
         data_key: &Zeroizing<[u8; 32]>,
         name: &str,
         value: &[u8],
     ) -> Result<(), VaultError> {
-        let _ = (data_key, name, value);
-        Err(VaultError::NotImplemented(
-            "kv support lands in M4, see plan/06-roadmap.md",
-        ))
+        let mut store = self.load_kv(data_key)?;
+        store.insert(name, value)?;
+        let encoded = Zeroizing::new(store.encode()?);
+        self.seal_payload(data_key, &encoded)
     }
 
     /// (mode = Kv) Get one entry's value.
@@ -533,26 +542,43 @@ impl Vault {
         data_key: &Zeroizing<[u8; 32]>,
         name: &str,
     ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
-        let _ = (data_key, name);
-        Err(VaultError::NotImplemented(
-            "kv support lands in M4, see plan/06-roadmap.md",
-        ))
+        let store = self.load_kv(data_key)?;
+        store
+            .get(name)
+            .map(|value| Zeroizing::new(value.to_vec()))
+            .ok_or_else(|| VaultError::NoSuchEntry(name.to_string()))
     }
 
-    /// (mode = Kv) Remove one entry.
+    /// (mode = Kv) Remove one entry. Errors if it was not there, so a typo'd name
+    /// cannot look like a successful deletion.
     pub fn kv_rm(&mut self, data_key: &Zeroizing<[u8; 32]>, name: &str) -> Result<(), VaultError> {
-        let _ = (data_key, name);
-        Err(VaultError::NotImplemented(
-            "kv support lands in M4, see plan/06-roadmap.md",
-        ))
+        let mut store = self.load_kv(data_key)?;
+        if !store.remove(name) {
+            return Err(VaultError::NoSuchEntry(name.to_string()));
+        }
+        let encoded = Zeroizing::new(store.encode()?);
+        self.seal_payload(data_key, &encoded)
     }
 
-    /// (mode = Kv) List entry names.
+    /// (mode = Kv) List entry names, sorted.
     pub fn kv_ls(&self, data_key: &Zeroizing<[u8; 32]>) -> Result<Vec<String>, VaultError> {
-        let _ = data_key;
-        Err(VaultError::NotImplemented(
-            "kv support lands in M4, see plan/06-roadmap.md",
-        ))
+        Ok(self.load_kv(data_key)?.names())
+    }
+
+    /// Verify the header, decrypt the payload, and parse it as a kv store.
+    fn load_kv(&self, data_key: &Zeroizing<[u8; 32]>) -> Result<KvMap, VaultError> {
+        self.expect_mode(Mode::Kv)?;
+        let plaintext = self.open_payload(data_key)?;
+        KvMap::decode(&plaintext)
+    }
+}
+
+/// The payload a freshly created vault holds: empty, but valid for its mode.
+fn empty_payload(mode: Mode) -> Result<Vec<u8>, VaultError> {
+    match mode {
+        Mode::File => Ok(Vec::new()),
+        Mode::Dir => archive::empty(),
+        Mode::Kv => KvMap::default().encode(),
     }
 }
 
@@ -1249,6 +1275,176 @@ mod tests {
             std::fs::read(out.join("alias.txt")).unwrap(),
             b"real contents"
         );
+    }
+
+    // ---------- kv mode (M4) ----------
+
+    fn new_kv_vault(dir: &TempDir) -> (PathBuf, Vault, Zeroizing<[u8; 32]>) {
+        let path = dir.path().join("kv.fido");
+        let vault = Vault::create(&path, Mode::Kv, &enrollment(1, KEK_A)).unwrap();
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        (path, vault, data_key)
+    }
+
+    #[test]
+    fn a_fresh_kv_vault_is_an_empty_store() {
+        let dir = TempDir::new().unwrap();
+        let (path, vault, data_key) = new_kv_vault(&dir);
+        assert!(vault.kv_ls(&data_key).unwrap().is_empty());
+
+        // And still so after a round trip through disk.
+        let reopened = Vault::open(&path).unwrap();
+        let data_key = reopened
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        assert!(reopened.kv_ls(&data_key).unwrap().is_empty());
+    }
+
+    #[test]
+    fn kv_set_get_ls_rm_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault, data_key) = new_kv_vault(&dir);
+
+        vault.kv_set(&data_key, "api-token", b"tok-12345").unwrap();
+        vault
+            .kv_set(&data_key, "recovery", b"one two three")
+            .unwrap();
+        vault.kv_set(&data_key, "binary", &[0u8, 255, 128]).unwrap();
+
+        assert_eq!(
+            vault.kv_ls(&data_key).unwrap(),
+            vec!["api-token", "binary", "recovery"]
+        );
+        assert_eq!(
+            &vault.kv_get(&data_key, "api-token").unwrap()[..],
+            b"tok-12345"
+        );
+
+        // Reopen from disk: every set must have been persisted, not just cached.
+        let mut reopened = Vault::open(&path).unwrap();
+        let data_key = reopened
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        assert_eq!(
+            &reopened.kv_get(&data_key, "binary").unwrap()[..],
+            &[0u8, 255, 128]
+        );
+
+        reopened.kv_rm(&data_key, "recovery").unwrap();
+        assert_eq!(
+            reopened.kv_ls(&data_key).unwrap(),
+            vec!["api-token", "binary"]
+        );
+        assert!(matches!(
+            reopened.kv_get(&data_key, "recovery"),
+            Err(VaultError::NoSuchEntry(_))
+        ));
+    }
+
+    #[test]
+    fn kv_set_overwrites_an_existing_entry() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault, data_key) = new_kv_vault(&dir);
+        vault.kv_set(&data_key, "k", b"first").unwrap();
+        vault.kv_set(&data_key, "k", b"second").unwrap();
+        assert_eq!(&vault.kv_get(&data_key, "k").unwrap()[..], b"second");
+        assert_eq!(vault.kv_ls(&data_key).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn kv_rm_of_a_missing_entry_is_an_error() {
+        // A typo'd name must not look like a successful deletion.
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault, data_key) = new_kv_vault(&dir);
+        vault.kv_set(&data_key, "present", b"x").unwrap();
+        assert!(matches!(
+            vault.kv_rm(&data_key, "absent"),
+            Err(VaultError::NoSuchEntry(_))
+        ));
+        assert_eq!(vault.kv_ls(&data_key).unwrap(), vec!["present"]);
+    }
+
+    #[test]
+    fn kv_rejects_an_unusable_name() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault, data_key) = new_kv_vault(&dir);
+        assert!(matches!(
+            vault.kv_set(&data_key, "", b"x"),
+            Err(VaultError::InvalidEntryName(_))
+        ));
+    }
+
+    #[test]
+    fn kv_values_are_not_readable_from_the_vault_file() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault, data_key) = new_kv_vault(&dir);
+        vault
+            .kv_set(&data_key, "the-name", b"MOST-SECRET-VALUE")
+            .unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        for needle in [&b"MOST-SECRET-VALUE"[..], &b"the-name"[..]] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "{:?} appears verbatim in the vault file",
+                String::from_utf8_lossy(needle)
+            );
+        }
+    }
+
+    #[test]
+    fn every_kv_write_draws_a_fresh_nonce() {
+        // Each `set` re-encrypts the whole store under a data key fixed for the
+        // vault's lifetime, so this is the case plan/03's nonce discipline is
+        // really about: anyone holding two versions of the file must not be able to
+        // XOR them and see which entry changed.
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault, data_key) = new_kv_vault(&dir);
+
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..5 {
+            vault
+                .kv_set(&data_key, "k", format!("value-{i}").as_bytes())
+                .unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            let offset = vault.payload_offset() as usize;
+            assert!(seen.insert(bytes[offset..].to_vec()), "ciphertext repeated");
+        }
+    }
+
+    #[test]
+    fn kv_operations_refuse_a_non_kv_vault() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        assert!(matches!(
+            vault.kv_set(&data_key, "k", b"v"),
+            Err(VaultError::WrongMode {
+                expected: Mode::Kv,
+                found: Mode::File
+            })
+        ));
+        assert!(matches!(
+            vault.kv_ls(&data_key),
+            Err(VaultError::WrongMode { .. })
+        ));
+    }
+
+    #[test]
+    fn a_failed_kv_set_leaves_the_store_untouched() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault, data_key) = new_kv_vault(&dir);
+        vault.kv_set(&data_key, "good", b"value").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(vault.kv_set(&data_key, "", b"x").is_err());
+
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(vault.kv_ls(&data_key).unwrap(), vec!["good"]);
     }
 
     // ---------- mode parsing ----------

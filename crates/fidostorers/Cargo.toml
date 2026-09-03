@@ -36,3 +36,6 @@ chacha20poly1305.workspace = true
 postcard.workspace = true
 tempfile.workspace = true
 tar.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

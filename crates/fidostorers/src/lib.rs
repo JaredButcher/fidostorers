@@ -8,6 +8,7 @@
 mod archive;
 mod crypto;
 mod error;
+mod kv;
 mod vault;
 
 pub use archive::{ExtractReport, SkippedEntry};
