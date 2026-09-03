@@ -130,7 +130,8 @@ authenticator mandates UV for `hmac-secret`, which some do), prompt on stdin for
 CLI, or accept a callback in the library API (`PinProvider`). Never log or persist a
 PIN. Because the Windows backend is raw HID rather than `webauthn.dll`, the callback
 fires on Windows too — the OS renders no PIN dialog of its own here, which reverses
-the asymmetry assumed in [07-open-decisions.md](07-open-decisions.md) #9.
+the asymmetry assumed in [07-open-decisions.md](07-open-decisions.md) #9. Confirmed
+against hardware (M1 test 6).
 
 ## CLI (`fido-token`)
 
@@ -194,11 +195,14 @@ pub enum TokenError {
   original plan assumed the `authenticator` crate had an OS-WebAuthn-API backend; M1
   established that it does not (version 0.5.0 contains no `webauthn.dll` code path).
   Since Windows 10 1903 a filter driver denies read/write opens of FIDO HID devices to
-  non-elevated processes, so **whether register/derive work without Administrator is
-  an open question** — see [06-roadmap.md](06-roadmap.md) M1,
+  non-elevated processes, and M1 hardware testing confirmed that this bites:
+  **`register` and `derive_secret` require an elevated process on Windows.** Accepted
+  as a known limitation for now; the direct `webauthn.dll` backend that would lift it
+  is tabled as phase-2 work — see [06-roadmap.md](06-roadmap.md) M1 and phase 2,
   [07-open-decisions.md](07-open-decisions.md) #1, and
   [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md) test 3.
   Device *enumeration* is unaffected: this crate implements it itself, opening devices
-  with zero desired access (metadata queries only), which that filter permits.
+  with zero desired access (metadata queries only), which that filter permits — `list`
+  is the one command that works unprivileged there.
 - macOS is a bonus, not a target; if the dependency's macOS backend works, we don't
   block it, but we don't test or support it in v1.

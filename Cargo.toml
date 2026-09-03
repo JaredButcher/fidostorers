@@ -21,6 +21,14 @@ clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 hmac = "0.12"
 sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
+# `use-std` gives the alloc-backed (de)serializers; the default feature set is
+# heapless-oriented and has no `to_stdvec`.
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+# Used for the temp-file-then-rename write path, so a crash mid-write cannot
+# corrupt an existing vault (plan/02, "Crash safety").
+tempfile = "3"
 log = "0.4"
 env_logger = "0.11"
 rpassword = "7"

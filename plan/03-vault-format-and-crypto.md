@@ -85,6 +85,7 @@ output must be labelled as such — see [04-security-and-threat-model.md](04-sec
 ┌──────────────────────────────────────────────────────────┐
 │ magic: b"FSTR" (4 bytes)                                  │
 │ format_version: u16                                       │
+│ header_len: u32   (byte length of the postcard body)       │
 │ mode: u8   (0 = file, 1 = dir, 2 = kv)                     │
 │ rp_id: length-prefixed UTF-8 string                        │
 │ credential_count: u16                                      │
@@ -107,6 +108,18 @@ is nothing secret in it — credential IDs and salts are meaningless without the
 physical authenticator, per the `hmac-secret` security model) but is authenticated by
 `header_mac`.
 
+`header_len` was **added during M2** and is not in the original sketch. It earns its
+four bytes twice: it bounds the header allocation before a single unauthenticated
+byte is parsed, and it locates `header_mac` without parsing the body first, so `open`
+— and therefore `fidostorers info` — reads only the header of a multi-gigabyte vault
+rather than the whole file. The fields between it and `header_mac` are one `postcard`
+struct; `mode`, `rp_id`, `credential_count` and the per-credential fields are that
+struct's members, so their exact widths are postcard's business, not the format's.
+
+Note also that `rp_id` appears twice — once for the vault and once inside each
+credential, since `fido_token::Credential` carries its own. `create` sources both from
+the same value; the parser rejects a file where they disagree.
+
 Serialization is `postcard` over `serde`-derived structs
 ([07-open-decisions.md](07-open-decisions.md) #5). Because `header_mac` is computed
 over the literal bytes written to disk and verified over the literal byte range read
@@ -119,6 +132,15 @@ unauthenticated file and `header_mac` cannot be verified until after the data ke
 recovered, so `credential_count`, `rp_id`'s length, and every length-prefixed byte
 string must be bounds-checked *before* allocating. A corrupt or hostile 8-byte length
 must not be able to drive a multi-gigabyte allocation.
+
+## Payload size
+
+The format puts **one** AEAD tag over the whole payload, so sealing and opening are
+single-shot: the entire plaintext is in memory at once. That is a consequence of the
+format, not an implementation shortcut — a streaming variant would need per-chunk
+tags and a chunk framing, which is a different on-disk layout. Peak memory is
+therefore the payload size, which is fine for `file` and `kv` but is the thing to
+re-examine in M3, where a directory tree can be arbitrarily large.
 
 ## Payload encoding per mode
 

@@ -73,30 +73,54 @@ needed for v1. Noted as a deliberate simplicity-over-scalability choice.
 ## Library surface
 
 Crate 2 also exposes a thin library (`fidostorers::vault`) so the CLI is a thin
-wrapper and so future GUI/other frontends aren't required to shell out:
+wrapper and so future GUI/other frontends aren't required to shell out. As
+implemented in M2 — the original sketch differed in two ways, noted below:
 
 ```rust
-pub struct Vault { /* opened header + path */ }
+/// Everything needed to give one security key the ability to unlock a vault.
+pub struct Enrollment {
+    pub credential: fido_token::Credential,
+    pub label: String,
+    pub salt: [u8; 32],
+    pub kek: Zeroizing<[u8; 32]>,
+}
+
+/// HKDF the raw hmac-secret output into a KEK. The CLI calls this between
+/// `fido_token::derive_secret` and `Vault`.
+pub fn kek_from_secret(secret: &[u8; 32]) -> Zeroizing<[u8; 32]>;
+
+pub struct Vault { /* opened header + the literal bytes header_mac covers + path */ }
 
 impl Vault {
-    pub fn create(path: &Path, mode: Mode, first: &fido_token::Credential, kek: Zeroizing<[u8;32]>) -> Result<Self, VaultError>;
-    pub fn open(path: &Path) -> Result<Self, VaultError>; // reads header only, no touch yet
-    pub fn credentials(&self) -> &[fido_token::Credential];
+    pub fn create(path: &Path, mode: Mode, enrollment: &Enrollment) -> Result<Self, VaultError>;
+    pub fn open(path: &Path) -> Result<Self, VaultError>; // header only, no touch, UNAUTHENTICATED
+    pub fn credentials(&self) -> &[CredentialEntry];
     pub fn unlock_with(&self, credential_id: &[u8], kek: Zeroizing<[u8;32]>) -> Result<Zeroizing<[u8;32]>, VaultError>; // -> data key
-    pub fn enroll(&mut self, data_key: &Zeroizing<[u8;32]>, new_cred: &fido_token::Credential, new_kek: Zeroizing<[u8;32]>) -> Result<(), VaultError>;
+    pub fn enroll(&mut self, data_key: &Zeroizing<[u8;32]>, enrollment: &Enrollment) -> Result<(), VaultError>;
     pub fn revoke(&mut self, data_key: &Zeroizing<[u8;32]>, credential_id: &[u8]) -> Result<(), VaultError>;
 
-    pub fn seal_file(&self, data_key: &Zeroizing<[u8;32]>, input: &Path) -> Result<(), VaultError>;
+    pub fn seal_file(&mut self, data_key: &Zeroizing<[u8;32]>, input: &Path) -> Result<(), VaultError>;
     pub fn open_file(&self, data_key: &Zeroizing<[u8;32]>, output: &Path) -> Result<(), VaultError>;
-    pub fn seal_dir(&self, data_key: &Zeroizing<[u8;32]>, input_dir: &Path) -> Result<(), VaultError>;
+    pub fn seal_dir(&mut self, data_key: &Zeroizing<[u8;32]>, input_dir: &Path) -> Result<(), VaultError>;
     pub fn open_dir(&self, data_key: &Zeroizing<[u8;32]>, output_dir: &Path) -> Result<(), VaultError>;
 
-    pub fn kv_set(&self, data_key: &Zeroizing<[u8;32]>, name: &str, value: &[u8]) -> Result<(), VaultError>;
+    pub fn kv_set(&mut self, data_key: &Zeroizing<[u8;32]>, name: &str, value: &[u8]) -> Result<(), VaultError>;
     pub fn kv_get(&self, data_key: &Zeroizing<[u8;32]>, name: &str) -> Result<Zeroizing<Vec<u8>>, VaultError>;
-    pub fn kv_rm(&self, data_key: &Zeroizing<[u8;32]>, name: &str) -> Result<(), VaultError>;
+    pub fn kv_rm(&mut self, data_key: &Zeroizing<[u8;32]>, name: &str) -> Result<(), VaultError>;
     pub fn kv_ls(&self, data_key: &Zeroizing<[u8;32]>) -> Result<Vec<String>, VaultError>;
 }
 ```
+
+**`Enrollment` instead of a bare `(credential, kek)`.** The original sketch had no
+salt parameter, which cannot work: the KEK *is* `HKDF(hmac-secret(credential, salt))`,
+so the header must store the very salt it was derived from or the KEK can never be
+re-derived. Passing the three as one struct makes them impossible to separate at a
+call site.
+
+**`seal_*` takes `&mut self`.** Sealing draws a fresh `payload_nonce` and sets
+`payload_len` — both header fields — so under the sketched `&self` the in-memory
+header would silently go stale against the file just written. A failed write rolls
+both fields back, so an ignored error cannot leave the two disagreeing either.
 
 `revoke` takes the data key because removing an entry changes the header, and the
 header's `header_mac` must be recomputed under a key derived from the data key (see
@@ -108,6 +132,11 @@ Note the split: `unlock_with` takes an already-derived KEK (crate 2 never import
 fido-token to get the KEK, then call Vault with it"). This keeps `Vault`'s unit tests
 hardware-free by construction: tests just pass in an arbitrary 32-byte KEK, matching
 what `fido-token::derive_secret` would have produced.
+
+The HKDF step between the two lives in this crate as `kek_from_secret`, not in
+`fido-token` and not in the binary: the domain separator `"fidostorers-kek-v1"` is
+part of the *vault format*, so it belongs beside the format that defines it, while
+the binary stays a pure orchestrator that never picks a crypto parameter of its own.
 
 ## Crash safety
 

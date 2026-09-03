@@ -7,7 +7,8 @@ question with real hardware, before anything is built on top of it:
 > the CTAP2 `hmac-secret` extension, on **both Linux and Windows**?
 
 Everything in [plan/03-vault-format-and-crypto.md](../plan/03-vault-format-and-crypto.md)
-assumes yes. This document is how you check.
+assumes yes. This document is how you check. **Windows: answered yes, but only from an
+elevated terminal. Linux: not yet run.** See [Results so far](#results-so-far).
 
 Unit tests cannot answer it — that is structural, not laziness. The whole point of
 the `Authenticator` trait seam is that everything *except* this question is testable
@@ -24,15 +25,17 @@ code path at all; its Windows backend is raw USB HID via SetupAPI and `hid.dll`,
 same approach it uses on Linux.
 
 This matters because Windows 10 1903+ ships a filter driver that denies **read/write**
-opens of FIDO HID devices to non-elevated processes. So the open question M1 must
-settle is no longer only "does hmac-secret work" but also:
+opens of FIDO HID devices to non-elevated processes. So the open question M1 had to
+settle was no longer only "does hmac-secret work" but also:
 
 > **Does `register`/`derive` work in a normal, non-elevated terminal, or does it
 > require Administrator?**
 
-Test 3 below is written specifically to answer that. Please run it both ways and
-record the result — it decides whether the project needs a `webauthn.dll` backend
-(plan/07-open-decisions.md #1's fallback), which is a substantial piece of work.
+Test 3 below was written specifically to answer that, and it now has: **it requires
+Administrator.** That outcome is recorded below and has been accepted as a known
+limitation for now, rather than blocking on the `webauthn.dll` backend
+(plan/07-open-decisions.md #1's fallback) — which is a substantial piece of work, now
+tabled as phase-2 (plan/06-roadmap.md).
 
 Note that *enumeration* (`fido-token list`) is unaffected: it opens devices with zero
 desired access, which only permits metadata queries and is not blocked by that filter.
@@ -44,6 +47,31 @@ own `c_void`, which are distinct types unless `winapi`'s `std` feature is on, an
 crate does not enable it. The workspace `Cargo.toml` declares `winapi` with that
 feature to fix it graph-wide via feature unification. If a future `authenticator`
 release enables it upstream, that declaration can be deleted.
+
+---
+
+## Results so far
+
+| Platform | Outcome |
+|---|---|
+| **Windows** | **Tests 1, 2, 4, 5, 6, 7 pass. Test 3 fails.** `hmac-secret` behaves exactly as [plan/03](../plan/03-vault-format-and-crypto.md) requires: deterministic, salt-bound, stable across a replug, wrong key correctly rejected, PIN prompt and `--no-pin` refusal both correct. **But all device interaction requires an elevated terminal** — only `list` (test 1) works unprivileged. |
+| **Linux** | **Not yet run.** This is the one outstanding M1 item. |
+
+Test 3's result is the `FAIL` (non-elevated) / `PASS` (elevated) row of its table: the
+Windows 10 1903 filter driver does bite, exactly as the finding above predicted.
+
+**This has been accepted as a known limitation for now** rather than treated as
+stop-the-line. The transport stays as chosen
+([plan/07-open-decisions.md](../plan/07-open-decisions.md) #1) and the direct
+`webauthn.dll` backend that would remove the requirement is **tabled as phase-2 work**
+([plan/06-roadmap.md](../plan/06-roadmap.md)). It should be revisited before any
+release aimed at non-developers. Until it exists, **run `fido-token` and `fidostorers`
+from an elevated terminal on Windows** — including for the manual hardware checks in
+M2 and later.
+
+So when re-running anything below on Windows, start the shell with **Run as
+Administrator**. The exceptions are test 1, which is expected to work either way, and
+test 3, whose entire point is to observe what unprivileged access does.
 
 ---
 
@@ -173,7 +201,11 @@ it invalidates the design in plan/03 for that platform. Capture `-vv` output.
 
 Run it on **both** Linux and Windows. Save the credential JSON it prints at the end.
 
-## Test 3 — Windows elevation (the open question)
+## Test 3 — Windows elevation (answered: elevation is required)
+
+**Result: `FAIL` non-elevated, `PASS` elevated** — the second row below. Kept here as
+the procedure to re-run after a Windows update, a driver change, or once a
+`webauthn.dll` backend exists.
 
 Run test 2 twice on Windows:
 
@@ -185,13 +217,14 @@ Record which succeed. Four outcomes, and what each means:
 | Non-elevated | Elevated | Meaning |
 |---|---|---|
 | PASS | PASS | Best case. The plan's `webauthn.dll` concern was unfounded for this path; correct plan/00 and plan/01 and move on to M2. |
-| FAIL | PASS | The 1903 restriction bites. `fidostorers` would require Administrator, which is unacceptable for a user tool → build the `webauthn.dll` backend (plan/07 #1 fallback). |
+| FAIL | PASS | **← this is what happened.** The 1903 restriction bites; `fidostorers` requires Administrator on Windows. Unacceptable for a shipped user tool long-term → build the `webauthn.dll` backend (plan/07 #1 fallback), **deferred to phase 2** and acceptable in the meantime. |
 | FAIL | FAIL | Something else is wrong; treat as a bug, not an elevation issue. Capture `-vv`. |
 | PASS | FAIL | Unexpected; capture `-vv`. |
 
 A denial shows up as `error: cannot access authenticator (on Windows this usually
 means the process is not elevated)` — exit code 9. That error variant exists to make
-this specific outcome unmistakable.
+this specific outcome unmistakable, and it is the message a non-elevated Windows run
+actually produces.
 
 ## Test 4 — persistence across a replug
 
@@ -280,5 +313,8 @@ logic.
 ## Reporting results
 
 For each platform, record: OS version, key model, which tests passed, and for any
-failure the `-vv` log. Test 3's outcome is the one that determines whether M1 closes
-or reopens plan/07 decision #1.
+failure the `-vv` log. Add the outcome to [Results so far](#results-so-far).
+
+Test 3's outcome was the one that determined whether plan/07 decision #1 stayed
+settled; it is now recorded, and #1 stands with a documented Windows limitation. What
+still closes M1 is a **Linux** run of tests 1, 2, 4, 5, 6 and 7.

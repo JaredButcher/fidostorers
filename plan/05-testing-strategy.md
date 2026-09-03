@@ -82,8 +82,9 @@ Covers: `list_devices` finds the plugged-in key, a full `register` → `derive_s
 round trip against real hardware confirms determinism holds outside the fake, and a
 basic Windows-vs-Linux parity check (same test binary, run manually on both OSes
 during development — see [06-roadmap.md](06-roadmap.md) M1 which calls out validating
-the Windows WebAuthn-API backend early precisely because it's the one thing unit
-tests structurally cannot cover).
+the Windows backend early precisely because it's the one thing unit tests
+structurally cannot cover; that validation is what turned up the elevation
+requirement). The Windows run is done; the Linux run is outstanding.
 
 ## What CI actually runs
 

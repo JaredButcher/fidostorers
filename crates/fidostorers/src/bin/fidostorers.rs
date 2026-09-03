@@ -1,9 +1,13 @@
 //! `fidostorers` CLI. See plan/02-crate-fidostorers.md.
 //!
-//! Every subcommand's argument parsing and dispatch plumbing is real; the bodies
-//! bottom out in `NotImplemented` errors today because the hardware backend (M1)
-//! and vault crypto (M2+) haven't landed yet — see plan/06-roadmap.md. Nothing here
-//! should need to change shape once those land, only the stub bodies get replaced.
+//! `init`, `lock`, `unlock`, and `info` are wired end to end for file mode (M2).
+//! `enroll`/`revoke` (M5), directory mode (M3), and kv mode (M4) still bottom out in
+//! `NotImplemented` — see plan/06-roadmap.md.
+//!
+//! This binary is where the two halves meet: it asks `fido-token` for an
+//! `hmac-secret` output, runs it through `fidostorers::kek_from_secret`, and hands
+//! the resulting KEK to `Vault`. The library never talks to hardware itself
+//! (plan/02-crate-fidostorers.md), so this orchestration lives here and only here.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -11,8 +15,10 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use fidostorers::{Mode, Vault};
+use fidostorers::{Enrollment, Mode, Vault};
+use rand::rngs::OsRng;
 use rand::RngCore;
+use zeroize::Zeroizing;
 
 const DEFAULT_RP_ID: &str = "fidostorers.local";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -50,9 +56,19 @@ enum Commands {
         credential: String,
     },
     /// (mode = file | dir) Encrypt `input` into the vault.
-    Lock { vault: PathBuf, input: PathBuf },
+    Lock {
+        vault: PathBuf,
+        input: PathBuf,
+        #[arg(long)]
+        require_uv: bool,
+    },
     /// (mode = file | dir) Decrypt the vault into `output`.
-    Unlock { vault: PathBuf, output: PathBuf },
+    Unlock {
+        vault: PathBuf,
+        output: PathBuf,
+        #[arg(long)]
+        require_uv: bool,
+    },
     /// (mode = kv) Manage individual encrypted key/value entries.
     Kv {
         #[command(subcommand)]
@@ -126,6 +142,70 @@ fn register_credential(rp_id: String, require_uv: bool) -> Result<fido_token::Cr
     })?)
 }
 
+/// Derive one credential's KEK: touch the key, get `hmac-secret(credential, salt)`,
+/// then HKDF it into a key-encryption key. This is the whole hardware seam.
+fn derive_kek(
+    credential: &fido_token::Credential,
+    salt: &[u8; 32],
+    require_uv: bool,
+) -> Result<Zeroizing<[u8; 32]>, fido_token::TokenError> {
+    let secret = fido_token::derive_secret(
+        credential,
+        salt,
+        &fido_token::DeriveOptions {
+            require_uv,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            pin_provider: fido_token::terminal_pin_provider(),
+        },
+    )?;
+    Ok(fidostorers::kek_from_secret(&secret))
+}
+
+/// Touch an enrolled key and recover the vault's data key.
+///
+/// Tries each enrolled credential in turn, because we cannot know in advance which
+/// of a vault's keys is the one plugged in. A key that does not hold a given
+/// credential says so without consuming the operation, so moving on to the next
+/// entry is the correct response rather than an error.
+fn unlock_vault(vault: &Vault, require_uv: bool) -> Result<Zeroizing<[u8; 32]>> {
+    let entries = vault.credentials();
+    let mut last_err = None;
+
+    for entry in entries {
+        if entries.len() > 1 {
+            eprintln!("trying enrolled key {:?}...", entry.label);
+        }
+        match derive_kek(&entry.credential, &entry.salt, require_uv) {
+            Ok(kek) => return Ok(vault.unlock_with(&entry.credential.credential_id, kek)?),
+            Err(fido_token::TokenError::UnknownCredential) => {
+                last_err = Some(fido_token::TokenError::UnknownCredential);
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+
+    match last_err {
+        Some(err) => Err(anyhow::Error::from(err).context(
+            "none of this vault's enrolled keys are connected (or the wrong key was touched)",
+        )),
+        None => bail!("vault has no enrolled credentials"),
+    }
+}
+
+/// `lock`/`unlock` only know file mode today. Directory mode is M3 and kv mode M4,
+/// so say which milestone rather than a bare "unsupported".
+fn not_yet_supported(mode: Mode) -> anyhow::Error {
+    let milestone = match mode {
+        Mode::Dir => "M3",
+        Mode::Kv => "M4",
+        Mode::File => unreachable!("file mode is implemented"),
+    };
+    anyhow::anyhow!(
+        "this is a {mode} vault; {mode} mode lands in {milestone}, see plan/06-roadmap.md"
+    )
+}
+
 fn run() -> Result<()> {
     match Cli::parse().command {
         Commands::Init {
@@ -134,22 +214,33 @@ fn run() -> Result<()> {
             rp_id,
             require_uv,
         } => {
+            if vault.exists() {
+                bail!("{vault:?} already exists; refusing to overwrite it");
+            }
             let credential = register_credential(rp_id, require_uv)?;
 
+            // The salt is drawn fresh per enrollment and stored in the header. It is
+            // not secret; its job is to separate this vault from any other using the
+            // same physical key (plan/03-vault-format-and-crypto.md).
             let mut salt = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut salt);
-            let secret = fido_token::derive_secret(
-                &credential,
-                &salt,
-                &fido_token::DeriveOptions {
-                    require_uv,
-                    timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
-                    pin_provider: fido_token::terminal_pin_provider(),
+            OsRng.fill_bytes(&mut salt);
+            let kek = derive_kek(&credential, &salt, require_uv)?;
+
+            Vault::create(
+                &vault,
+                mode,
+                &Enrollment {
+                    credential,
+                    label: "primary".to_string(),
+                    salt,
+                    kek,
                 },
             )?;
-
-            Vault::create(&vault, mode, &credential, "primary", secret)?;
             println!("created {mode} vault at {vault:?}");
+            println!(
+                "WARNING: this vault can only be opened by that security key. Enroll a \
+                 second key you keep somewhere safe, or losing this one destroys the data."
+            );
         }
         Commands::Enroll { vault } => {
             let _ = Vault::open(&vault)?;
@@ -165,23 +256,35 @@ fn run() -> Result<()> {
             let _ = (&vault, &credential_id);
             bail!("revocation lands in M5, see plan/06-roadmap.md");
         }
-        Commands::Lock { vault, input } => {
-            let vault = Vault::open(&vault)?;
-            let _ = input;
-            bail!(
-                "locking requires touching an enrolled key to obtain the data key; \
-                 wiring that up is M2/M3 (mode = {}), see plan/06-roadmap.md",
-                vault.mode()
-            );
+        Commands::Lock {
+            vault: path,
+            input,
+            require_uv,
+        } => {
+            let mut vault = Vault::open(&path)?;
+            match vault.mode() {
+                Mode::File => {
+                    let data_key = unlock_vault(&vault, require_uv)?;
+                    vault.seal_file(&data_key, &input)?;
+                    println!("locked {input:?} into {path:?}");
+                }
+                mode => return Err(not_yet_supported(mode)),
+            }
         }
-        Commands::Unlock { vault, output } => {
-            let vault = Vault::open(&vault)?;
-            let _ = output;
-            bail!(
-                "unlocking requires touching an enrolled key; wiring that up is M2/M3 \
-                 (mode = {}), see plan/06-roadmap.md",
-                vault.mode()
-            );
+        Commands::Unlock {
+            vault: path,
+            output,
+            require_uv,
+        } => {
+            let vault = Vault::open(&path)?;
+            match vault.mode() {
+                Mode::File => {
+                    let data_key = unlock_vault(&vault, require_uv)?;
+                    vault.open_file(&data_key, &output)?;
+                    println!("unlocked {path:?} into {output:?}");
+                }
+                mode => return Err(not_yet_supported(mode)),
+            }
         }
         Commands::Kv { command } => match command {
             KvCommands::Set {
@@ -208,7 +311,14 @@ fn run() -> Result<()> {
         },
         Commands::Info { vault } => {
             let vault = Vault::open(&vault)?;
+            // header_mac can only be checked with the data key, which needs a touch.
+            // `info` deliberately requires none, so everything below is unverified
+            // and must be labelled as such (plan/04-security-and-threat-model.md).
+            println!("UNAUTHENTICATED: shown without touching a key, so none of it is");
+            println!("verified. Decide nothing security-relevant from this output.");
+            println!();
             println!("mode: {}", vault.mode());
+            println!("rp id: {}", vault.rp_id());
             println!("format version: {}", vault.format_version());
             println!("enrolled credentials:");
             for entry in vault.credentials() {

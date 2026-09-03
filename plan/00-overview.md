@@ -103,7 +103,7 @@ See [02-crate-fidostorers.md](02-crate-fidostorers.md) and
 
 | Concern | Choice | Rationale |
 |---|---|---|
-| CTAP transport | [`authenticator`](https://crates.io/crates/authenticator) crate (Mozilla, used in Firefox) | The mature Rust crate with CTAP1+CTAP2 and a working `hmac-secret` implementation, on Linux and Windows. Avoids hand-rolling CTAP2/PIN-protocol/HID framing. **Correction (M1):** contrary to the original assumption here, this crate has *no* `webauthn.dll` backend — its Windows path is raw USB HID via SetupAPI, the same as Linux. Whether that works unprivileged on Windows 10 1903+ is the open question M1 must answer; see [07-open-decisions.md](07-open-decisions.md) #1 and [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md). |
+| CTAP transport | [`authenticator`](https://crates.io/crates/authenticator) crate (Mozilla, used in Firefox) | The mature Rust crate with CTAP1+CTAP2 and a working `hmac-secret` implementation, on Linux and Windows. Avoids hand-rolling CTAP2/PIN-protocol/HID framing. **Correction (M1):** contrary to the original assumption here, this crate has *no* `webauthn.dll` backend — its Windows path is raw USB HID via SetupAPI, the same as Linux. It does **not** work unprivileged on Windows 10 1903+: hardware testing confirmed every device interaction needs an elevated terminal. Accepted as a known limitation for now, with a direct `webauthn.dll` backend deferred to phase 2; see [07-open-decisions.md](07-open-decisions.md) #1, [06-roadmap.md](06-roadmap.md) and [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md). |
 | AEAD | XChaCha20-Poly1305 (`chacha20poly1305` crate) | 192-bit nonce removes nonce-reuse foot-guns for randomly generated nonces (relevant since we may write many small KV entries over a vault's lifetime); pure-Rust, constant-time, no hardware AES dependency. |
 | KDF (secret → key) | HKDF-SHA256 (`hkdf` crate) | Standard way to turn the 32-byte `hmac-secret` output into a properly domain-separated AEAD key. |
 | Serialization | `postcard` over `serde`-derived structs for vault headers | Compact and deterministic without hand-rolling an encoder. Encoder-version stability is an ordinary compatibility concern here rather than a security property, because `header_mac` is computed over the literal bytes written to disk and verified over the literal bytes read back. Requires parse-time bounds on every length prefix, since the header is read before it can be authenticated. |
@@ -114,10 +114,10 @@ See [02-crate-fidostorers.md](02-crate-fidostorers.md) and
 | Errors | `thiserror` (library crates), `anyhow` (CLI binaries) | Standard split: typed errors in libraries, ergonomic bubbling in binaries. |
 
 All of these are confirmed in [07-open-decisions.md](07-open-decisions.md), which
-records the ten decisions and their rationale. The CTAP transport (#1) is the one
-choice still genuinely in play: M1 found that the Windows path is raw HID rather than
-the OS WebAuthn API, so whether it works for a non-elevated user is now a live
-question rather than a settled assumption.
+records the decisions and their rationale. The CTAP transport (#1) was reopened by an
+M1 finding — the Windows path is raw HID, not the OS WebAuthn API — and is now settled
+with a known limitation: **on Windows the tool must run elevated.** That is accepted
+for now, and the `webauthn.dll` backend that would lift it is tabled as phase-2 work.
 
 ## Document index
 
