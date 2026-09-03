@@ -1,8 +1,7 @@
 //! `fidostorers` CLI. See plan/02-crate-fidostorers.md.
 //!
-//! `init`, `lock`, `unlock`, `kv`, and `info` are wired end to end for all three
-//! modes (M2–M4). `enroll`/`revoke` (M5) still bottom out in `NotImplemented` — see
-//! plan/06-roadmap.md.
+//! Every subcommand is wired end to end: all three modes (M2–M4) and multi-key
+//! enrollment/revocation (M5). See plan/06-roadmap.md.
 //!
 //! This binary is where the two halves meet: it asks `fido-token` for an
 //! `hmac-secret` output, runs it through `fidostorers::kek_from_secret`, and hands
@@ -51,17 +50,29 @@ enum Commands {
         mode: Mode,
         #[arg(long, default_value = DEFAULT_RP_ID)]
         rp_id: String,
+        /// Name for this key, shown by `fidostorers info`.
+        #[arg(long, default_value = "primary")]
+        label: String,
         #[arg(long)]
         require_uv: bool,
     },
     /// Add another security key that can unlock an existing vault.
-    Enroll { vault: PathBuf },
+    Enroll {
+        vault: PathBuf,
+        /// Name for the new key, shown by `fidostorers info` (e.g. "backup in safe").
+        #[arg(long, default_value = "backup")]
+        label: String,
+        #[arg(long)]
+        require_uv: bool,
+    },
     /// Remove a security key's ability to unlock an existing vault.
     Revoke {
         vault: PathBuf,
         /// Hex-encoded credential ID, as shown by `fidostorers info`.
         #[arg(long)]
         credential: String,
+        #[arg(long)]
+        require_uv: bool,
     },
     /// (mode = file | dir) Encrypt `input` into the vault.
     Lock {
@@ -234,6 +245,7 @@ fn run() -> Result<i32> {
             vault,
             mode,
             rp_id,
+            label,
             require_uv,
         } => {
             if vault.exists() {
@@ -253,7 +265,7 @@ fn run() -> Result<i32> {
                 mode,
                 &Enrollment {
                     credential,
-                    label: "primary".to_string(),
+                    label,
                     salt,
                     kek,
                 },
@@ -264,19 +276,73 @@ fn run() -> Result<i32> {
                  second key you keep somewhere safe, or losing this one destroys the data."
             );
         }
-        Commands::Enroll { vault } => {
-            let _ = Vault::open(&vault)?;
-            bail!("enrollment lands in M5, see plan/06-roadmap.md");
+        Commands::Enroll {
+            vault: path,
+            label,
+            require_uv,
+        } => {
+            let mut vault = Vault::open(&path)?;
+
+            eprintln!("Touch a security key that is ALREADY enrolled in this vault.");
+            let data_key = unlock_vault(&vault, require_uv)?;
+
+            eprintln!();
+            eprintln!("Now connect the NEW security key to add (unplug the first if they");
+            eprintln!("share a port), then touch it. It will be asked for twice.");
+            // The rp_id comes from the vault, not the CLI default: a credential made
+            // for a different rp_id could never derive a working KEK here.
+            let credential = register_credential(vault.rp_id().to_string(), require_uv)?;
+
+            let mut salt = [0u8; 32];
+            OsRng.fill_bytes(&mut salt);
+            let kek = derive_kek(&credential, &salt, require_uv)?;
+
+            vault.enroll(
+                &data_key,
+                &Enrollment {
+                    credential,
+                    label: label.clone(),
+                    salt,
+                    kek,
+                },
+            )?;
+            println!(
+                "enrolled {label:?}; {path:?} now has {} keys",
+                vault.credentials().len()
+            );
         }
-        Commands::Revoke { vault, credential } => {
+        Commands::Revoke {
+            vault: path,
+            credential,
+            require_uv,
+        } => {
             let credential_id = from_hex(&credential).context("--credential must be hex")?;
-            let vault = Vault::open(&vault)?;
-            // Revoking rewrites the header, so `header_mac` has to be recomputed under
-            // a key derived from the data key (plan/03-vault-format-and-crypto.md).
-            // That means unlocking with a surviving credential first; wiring up that
-            // touch is M5, same as enrollment.
-            let _ = (&vault, &credential_id);
-            bail!("revocation lands in M5, see plan/06-roadmap.md");
+            let mut vault = Vault::open(&path)?;
+
+            let label = vault
+                .credentials()
+                .iter()
+                .find(|entry| entry.credential.credential_id == credential_id)
+                .map(|entry| entry.label.clone());
+
+            eprintln!("Touch a security key that is enrolled in this vault.");
+            let data_key = unlock_vault(&vault, require_uv)?;
+            vault.revoke(&data_key, &credential_id)?;
+
+            let label = label.unwrap_or_else(|| "that key".to_string());
+            println!(
+                "revoked {label:?}; {path:?} now has {} keys",
+                vault.credentials().len()
+            );
+            eprintln!();
+            eprintln!(
+                "WARNING: this removes the key from THIS file only. The data key itself is\n\
+                 unchanged, so anyone holding both the revoked key and an older copy of this\n\
+                 vault (a backup, a synced folder, git history) can still recover it — and\n\
+                 that same data key still decrypts the current contents. If the revoked key\n\
+                 may be in someone else's hands, create a new vault and re-seal your data\n\
+                 into it rather than relying on this."
+            );
         }
         Commands::Lock {
             vault: path,
@@ -489,11 +555,13 @@ mod tests {
                 vault,
                 mode,
                 rp_id,
+                label,
                 require_uv,
             } => {
                 assert_eq!(vault, PathBuf::from("myvault.fido"));
                 assert_eq!(mode, Mode::File);
                 assert_eq!(rp_id, DEFAULT_RP_ID);
+                assert_eq!(label, "primary");
                 assert!(!require_uv);
             }
             _ => panic!("expected Init"),
@@ -553,11 +621,44 @@ mod tests {
             Cli::try_parse_from(["fidostorers", "revoke", "v.fido", "--credential", "aabbcc"])
                 .unwrap();
         match cli.command {
-            Commands::Revoke { vault, credential } => {
+            Commands::Revoke {
+                vault,
+                credential,
+                require_uv,
+            } => {
                 assert_eq!(vault, PathBuf::from("v.fido"));
                 assert_eq!(credential, "aabbcc");
+                assert!(!require_uv);
             }
             _ => panic!("expected Revoke"),
+        }
+    }
+
+    #[test]
+    fn parses_enroll_with_a_label() {
+        let cli =
+            Cli::try_parse_from(["fidostorers", "enroll", "v.fido", "--label", "in the safe"])
+                .unwrap();
+        match cli.command {
+            Commands::Enroll {
+                vault,
+                label,
+                require_uv,
+            } => {
+                assert_eq!(vault, PathBuf::from("v.fido"));
+                assert_eq!(label, "in the safe");
+                assert!(!require_uv);
+            }
+            _ => panic!("expected Enroll"),
+        }
+    }
+
+    #[test]
+    fn enroll_defaults_its_label() {
+        let cli = Cli::try_parse_from(["fidostorers", "enroll", "v.fido"]).unwrap();
+        match cli.command {
+            Commands::Enroll { label, .. } => assert_eq!(label, "backup"),
+            _ => panic!("expected Enroll"),
         }
     }
 

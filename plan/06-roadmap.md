@@ -151,10 +151,50 @@ itself prefers — redirecting stdout to another process never puts the plaintex
 disk at all.
 
 ## M5 — Multi-key enrollment & revocation
-- `enroll`, `revoke` across all three modes.
-- Enrollment/revocation unit tests, "can't revoke last key" guard.
-- Manual test with two physical keys: enroll both, revoke one, confirm the other
+
+**Code: done. Hardware validation: outstanding.**
+
+- [x] `enroll`, `revoke` across all three modes.
+- [x] Enrollment/revocation unit tests, "can't revoke last key" guard, and the
+  properties that matter: either key yields the *same* data key, enrolling leaves the
+  payload ciphertext byte-identical, a revoked key stops working while the survivor
+  keeps working.
+- [ ] Manual test with two physical keys: enroll both, revoke one, confirm the other
   still works.
+
+### Finding: revocation does not re-key the vault
+
+Confirmed by experiment, not just by reading the design. The data key never changes,
+so someone holding **both a revoked key and any older copy of the vault file** —
+a backup, a synced folder, git history — can recover the data key from that old copy,
+**and that same data key still decrypts the current file.** Revocation removes a key's
+entry from this file; it does not retroactively protect the contents.
+
+This is inherent to the wrap-a-shared-data-key design (age and GPG multi-recipient
+files behave identically) and is the direct cost of the property that makes `revoke`
+usable at all: not having to touch every remaining key. It is now documented in
+[04-security-and-threat-model.md](04-security-and-threat-model.md) and warned about in
+the `revoke` CLI output.
+
+A true re-key — new data key, payload re-encrypted, every surviving credential
+re-wrapped — would need every remaining key physically present. Worth offering as an
+explicit `--rekey` in a later milestone; deliberately not silently substituted for
+`revoke`, since a `revoke` that demands the backup key from the safe is exactly the
+failure plan/07 #5b set out to avoid.
+
+### Refinements made while implementing
+
+1. **`enroll`/`revoke` stream the existing payload across rather than re-encrypting
+   it.** They change only the header, so decrypting and resealing a possibly enormous
+   `dir` payload would be pure waste. `write` now takes a payload *source*: fresh
+   bytes, or a byte range copied from the current file.
+2. **Both verify `header_mac` before touching anything**, including before the
+   "unknown credential" and "last credential" guards, per plan/03's ordering rule.
+3. **`enroll` rejects a duplicate credential and an `rp_id` mismatch**, neither of
+   which the sketch mentioned. A credential made for a different `rp_id` could never
+   derive a working KEK, so accepting it would enroll a key that silently never works.
+4. **`init --label` and `enroll --label`** name each key, so `info` can show
+   "backup in safe" rather than an opaque credential ID.
 
 ## M6 — Polish & docs
 - User-facing README covering install (incl. Linux udev rules), quick start per mode,

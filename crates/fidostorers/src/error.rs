@@ -17,6 +17,15 @@ pub enum VaultError {
     #[error("refusing to revoke the last remaining credential")]
     LastCredential,
 
+    #[error("that security key is already enrolled in this vault")]
+    AlreadyEnrolled,
+
+    #[error("this vault already has the maximum of {max} enrolled credentials")]
+    TooManyCredentials { max: usize },
+
+    #[error("credential is for rp_id {found:?} but this vault uses {expected:?}")]
+    RpIdMismatch { expected: String, found: String },
+
     #[error("authentication failed: wrong key, or the vault is corrupted or tampered with")]
     AuthenticationFailed,
 

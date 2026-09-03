@@ -97,6 +97,19 @@ large file, so this is not the interesting attack.
   therefore verifies the MAC first.
 - An attacker cannot add a working credential entry: forging a wrapped data key
   requires the data key itself.
+- **Revocation is not re-keying** (M5). `revoke` removes a credential's wrapped entry
+  from the current file. It does *not* change the data key, because doing so would
+  mean re-wrapping for every surviving credential — which would require physically
+  touching each of them, including the backup key in a safe, which is precisely the
+  failure mode [07-open-decisions.md](07-open-decisions.md) #5b rejected.
+  The consequence, verified experimentally: anyone holding **the revoked key plus any
+  older copy of the vault file** (backup, cloud-sync history, filesystem snapshot,
+  git) can recover the data key from that old copy — and the same data key still
+  decrypts the *current* file. So `revoke` protects against "someone finds this file
+  later and has the old key", not against "the old key's holder already copied the
+  file". If a revoked key may be in someone else's hands, treat the contents as
+  compromised: create a new vault and re-seal into it. The CLI says so when revoking.
+  This is the same property as removing a recipient from an `age` or GPG file.
 - `format_version` is checked on open; unknown versions are a hard error, not a
   best-effort parse, to avoid ever silently misinterpreting a header.
 - Header length prefixes are read before `header_mac` can be verified, so they are

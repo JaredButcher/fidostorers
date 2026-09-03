@@ -1,10 +1,8 @@
 //! Vault: header format, credential enrollment, and the payload pipeline, per
 //! plan/03-vault-format-and-crypto.md.
 //!
-//! File mode (`create`/`open`/`unlock_with`/`seal_file`/`open_file`) is milestone
-//! M2 and is implemented. Directory support is M3, KV support is M4, and
-//! enrollment/revocation are M5; those bodies still return
-//! [`VaultError::NotImplemented`] — see plan/06-roadmap.md.
+//! All three modes and multi-key enrollment are implemented: file mode (M2),
+//! directory mode (M3), kv mode (M4), and enroll/revoke (M5). See plan/06-roadmap.md.
 //!
 //! # On-disk layout
 //!
@@ -30,7 +28,7 @@
 
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -141,6 +139,21 @@ struct HeaderBody {
     payload_len: u64,
 }
 
+/// Where the payload bytes for a write come from.
+///
+/// `enroll` and `revoke` change only the header, and re-encrypting the payload to
+/// rewrite it would be both wasteful and pointless — so they stream the existing
+/// ciphertext across unchanged rather than decrypting and resealing a possibly
+/// enormous `dir` payload.
+enum PayloadSource<'a> {
+    Bytes(&'a [u8]),
+    /// Copy `len` bytes from `offset` in the vault's current file.
+    Existing {
+        offset: u64,
+        len: u64,
+    },
+}
+
 /// An opened vault: its header, plus the exact header bytes the MAC covers.
 #[derive(Debug, Clone)]
 pub struct Vault {
@@ -187,7 +200,7 @@ impl Vault {
             mac_covered: Vec::new(),
             header_mac: [0u8; MAC_LEN],
         };
-        vault.write(&data_key, &payload)?;
+        vault.write(&data_key, PayloadSource::Bytes(&payload))?;
         Ok(vault)
     }
 
@@ -340,15 +353,42 @@ impl Vault {
 
     /// Enroll an additional credential, so it can independently unlock this vault.
     /// Requires the already-unwrapped `data_key` (from a prior `unlock_with`).
+    ///
+    /// Only this credential's entry is added; no other entry is re-wrapped, so a
+    /// backup key sitting in a safe is unaffected and need not be present.
     pub fn enroll(
         &mut self,
         data_key: &Zeroizing<[u8; 32]>,
         enrollment: &Enrollment,
     ) -> Result<(), VaultError> {
-        let _ = (data_key, enrollment);
-        Err(VaultError::NotImplemented(
-            "enrollment lands in M5, see plan/06-roadmap.md",
-        ))
+        self.verify_header(data_key)?;
+
+        if enrollment.credential.rp_id != self.body.rp_id {
+            return Err(VaultError::RpIdMismatch {
+                expected: self.body.rp_id.clone(),
+                found: enrollment.credential.rp_id.clone(),
+            });
+        }
+        if self
+            .body
+            .credentials
+            .iter()
+            .any(|entry| entry.credential.credential_id == enrollment.credential.credential_id)
+        {
+            return Err(VaultError::AlreadyEnrolled);
+        }
+        if self.body.credentials.len() >= MAX_CREDENTIALS {
+            return Err(VaultError::TooManyCredentials {
+                max: MAX_CREDENTIALS,
+            });
+        }
+
+        self.body.credentials.push(wrap_for(enrollment, data_key)?);
+        if let Err(err) = self.rewrite_header(data_key) {
+            self.body.credentials.pop();
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Remove a credential's ability to unlock this vault. Refuses to remove the
@@ -360,19 +400,44 @@ impl Vault {
     /// first. No other credential's wrapped key needs re-wrapping, which is what
     /// lets a backup key in a safe keep working without being present for the
     /// revoke (plan/07 #5b).
+    /// **Revocation does not re-key the vault.** The data key is unchanged, so
+    /// anyone holding both the revoked key *and* a copy of this file from before
+    /// the revoke can still recover that data key — and it still decrypts the
+    /// current payload. See plan/04-security-and-threat-model.md.
     pub fn revoke(
         &mut self,
         data_key: &Zeroizing<[u8; 32]>,
         credential_id: &[u8],
     ) -> Result<(), VaultError> {
-        self.find_credential(credential_id)?;
+        // Verify before acting on any header content, per plan/03's ordering.
+        self.verify_header(data_key)?;
+
+        let index = self
+            .body
+            .credentials
+            .iter()
+            .position(|entry| entry.credential.credential_id == credential_id)
+            .ok_or(VaultError::UnknownCredential)?;
         if self.body.credentials.len() <= 1 {
             return Err(VaultError::LastCredential);
         }
-        let _ = data_key;
-        Err(VaultError::NotImplemented(
-            "revocation lands in M5, see plan/06-roadmap.md",
-        ))
+
+        let removed = self.body.credentials.remove(index);
+        if let Err(err) = self.rewrite_header(data_key) {
+            self.body.credentials.insert(index, removed);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Rewrite the header, carrying the existing payload ciphertext across
+    /// untouched. Used by `enroll`/`revoke`, which change no payload bytes.
+    fn rewrite_header(&mut self, data_key: &Zeroizing<[u8; 32]>) -> Result<(), VaultError> {
+        let source = PayloadSource::Existing {
+            offset: self.payload_offset(),
+            len: self.body.payload_len + TAG_LEN as u64,
+        };
+        self.write(data_key, source)
     }
 
     /// (mode = File) Encrypt `input`'s bytes into this vault.
@@ -420,7 +485,7 @@ impl Vault {
 
         // Restore the in-memory header if the write fails, so a caller that ignores
         // the error can't go on to act on a header that never reached disk.
-        if let Err(err) = self.write(data_key, &payload) {
+        if let Err(err) = self.write(data_key, PayloadSource::Bytes(&payload)) {
             self.body.payload_nonce = previous.0;
             self.body.payload_len = previous.1;
             return Err(err);
@@ -455,7 +520,7 @@ impl Vault {
     /// header + payload to a temp file in the vault's own directory before renaming
     /// it into place. The rename is atomic on both Linux and Windows for same-volume
     /// moves, so a crash mid-write cannot corrupt an existing vault.
-    fn write(&mut self, data_key: &[u8; 32], payload: &[u8]) -> Result<(), VaultError> {
+    fn write(&mut self, data_key: &[u8; 32], payload: PayloadSource<'_>) -> Result<(), VaultError> {
         let body_bytes = postcard::to_stdvec(&self.body)
             .map_err(|err| VaultError::Internal(format!("cannot serialize header: {err}")))?;
         if body_bytes.len() > MAX_HEADER_LEN {
@@ -479,7 +544,21 @@ impl Vault {
         let mut temp = tempfile::NamedTempFile::new_in(directory)?;
         temp.write_all(&mac_covered)?;
         temp.write_all(&header_mac)?;
-        temp.write_all(payload)?;
+        match payload {
+            PayloadSource::Bytes(bytes) => temp.write_all(bytes)?,
+            PayloadSource::Existing { offset, len } => {
+                // Stream it rather than buffering: a `dir` vault's payload can be
+                // arbitrarily large, and none of it is changing.
+                let mut current = File::open(&self.path)?;
+                current.seek(SeekFrom::Start(offset))?;
+                let copied = io::copy(&mut current.take(len), &mut temp)?;
+                if copied != len {
+                    return Err(VaultError::MalformedHeader(format!(
+                        "expected {len} payload bytes but the file holds {copied}"
+                    )));
+                }
+            }
+        }
         temp.flush()?;
         temp.as_file().sync_all()?;
         temp.persist(&self.path)
@@ -1277,6 +1356,233 @@ mod tests {
         );
     }
 
+    // ---------- multi-key enrollment and revocation (M5) ----------
+
+    #[test]
+    fn either_enrolled_key_unlocks_the_vault() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault.enroll(&data_key, &enrollment(2, KEK_B)).unwrap();
+
+        let reopened = Vault::open(&path).unwrap();
+        assert_eq!(reopened.credentials().len(), 2);
+
+        let via_a = reopened
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        let via_b = reopened
+            .unlock_with(&credential(2).credential_id, kek(KEK_B))
+            .unwrap();
+        assert_eq!(*via_a, *via_b, "both keys must yield the same data key");
+        assert_eq!(*via_a, *data_key);
+    }
+
+    #[test]
+    fn enrolling_does_not_disturb_the_payload() {
+        // The point of wrapping one data key per credential: adding a key must not
+        // re-encrypt a potentially enormous payload.
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault) = new_vault(&dir, Mode::File);
+        let input = dir.path().join("input.bin");
+        let contents = vec![0xA5u8; 4096];
+        std::fs::write(&input, &contents).unwrap();
+
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault.seal_file(&data_key, &input).unwrap();
+
+        let before = std::fs::read(&path).unwrap();
+        let payload_before = before[vault.payload_offset() as usize..].to_vec();
+
+        vault.enroll(&data_key, &enrollment(2, KEK_B)).unwrap();
+
+        let after = std::fs::read(&path).unwrap();
+        let payload_after = after[vault.payload_offset() as usize..].to_vec();
+        assert_eq!(
+            payload_before, payload_after,
+            "the payload ciphertext was rewritten by an enroll"
+        );
+
+        // ...and it still decrypts, through the newly added key.
+        let reopened = Vault::open(&path).unwrap();
+        let via_b = reopened
+            .unlock_with(&credential(2).credential_id, kek(KEK_B))
+            .unwrap();
+        let out = dir.path().join("out.bin");
+        reopened.open_file(&via_b, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), contents);
+    }
+
+    #[test]
+    fn a_revoked_key_can_no_longer_unlock_but_the_survivor_can() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault.enroll(&data_key, &enrollment(2, KEK_B)).unwrap();
+        vault
+            .revoke(&data_key, &credential(1).credential_id)
+            .unwrap();
+
+        let reopened = Vault::open(&path).unwrap();
+        assert_eq!(reopened.credentials().len(), 1);
+        assert!(matches!(
+            reopened.unlock_with(&credential(1).credential_id, kek(KEK_A)),
+            Err(VaultError::UnknownCredential)
+        ));
+        let via_b = reopened
+            .unlock_with(&credential(2).credential_id, kek(KEK_B))
+            .unwrap();
+        assert_eq!(*via_b, *data_key);
+    }
+
+    #[test]
+    fn revoking_leaves_the_payload_readable_through_the_remaining_key() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault) = new_vault(&dir, Mode::File);
+        let input = dir.path().join("input.bin");
+        std::fs::write(&input, b"still here after a revoke").unwrap();
+
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault.seal_file(&data_key, &input).unwrap();
+        vault.enroll(&data_key, &enrollment(2, KEK_B)).unwrap();
+        vault
+            .revoke(&data_key, &credential(1).credential_id)
+            .unwrap();
+
+        let reopened = Vault::open(&path).unwrap();
+        let via_b = reopened
+            .unlock_with(&credential(2).credential_id, kek(KEK_B))
+            .unwrap();
+        let out = dir.path().join("out.bin");
+        reopened.open_file(&via_b, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"still here after a revoke");
+    }
+
+    #[test]
+    fn enroll_rejects_a_key_that_is_already_enrolled() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        let err = vault.enroll(&data_key, &enrollment(1, KEK_B)).unwrap_err();
+        assert!(matches!(err, VaultError::AlreadyEnrolled), "got {err:?}");
+        assert_eq!(vault.credentials().len(), 1);
+    }
+
+    #[test]
+    fn enroll_rejects_a_credential_for_a_different_rp_id() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+
+        let mut foreign = enrollment(2, KEK_B);
+        foreign.credential.rp_id = "somewhere.else".to_string();
+        let err = vault.enroll(&data_key, &foreign).unwrap_err();
+        assert!(
+            matches!(err, VaultError::RpIdMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn enrollment_survives_a_round_trip_with_its_label_and_salt() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+
+        let mut second = enrollment(2, KEK_B);
+        second.label = "backup in safe".to_string();
+        second.salt = [0x2Bu8; 32];
+        vault.enroll(&data_key, &second).unwrap();
+
+        let reopened = Vault::open(&path).unwrap();
+        let entry = &reopened.credentials()[1];
+        assert_eq!(entry.label, "backup in safe");
+        assert_eq!(entry.salt, [0x2Bu8; 32]);
+        assert_eq!(entry.credential.credential_id, credential(2).credential_id);
+    }
+
+    #[test]
+    fn enroll_and_revoke_work_across_every_mode() {
+        for mode in [Mode::File, Mode::Dir, Mode::Kv] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("v.fido");
+            let mut vault = Vault::create(&path, mode, &enrollment(1, KEK_A)).unwrap();
+            let data_key = vault
+                .unlock_with(&credential(1).credential_id, kek(KEK_A))
+                .unwrap();
+
+            vault.enroll(&data_key, &enrollment(2, KEK_B)).unwrap();
+            vault
+                .revoke(&data_key, &credential(1).credential_id)
+                .unwrap();
+
+            let reopened = Vault::open(&path).unwrap();
+            assert_eq!(reopened.mode(), mode);
+            let via_b = reopened
+                .unlock_with(&credential(2).credential_id, kek(KEK_B))
+                .unwrap();
+            assert_eq!(*via_b, *data_key, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn many_keys_can_be_enrolled_and_all_still_work() {
+        let dir = TempDir::new().unwrap();
+        let (path, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+
+        for id in 2..=8u8 {
+            vault.enroll(&data_key, &enrollment(id, [id; 32])).unwrap();
+        }
+
+        let reopened = Vault::open(&path).unwrap();
+        assert_eq!(reopened.credentials().len(), 8);
+        for id in 1..=8u8 {
+            let this_kek = if id == 1 { KEK_A } else { [id; 32] };
+            let unlocked = reopened
+                .unlock_with(&credential(id).credential_id, kek(this_kek))
+                .unwrap();
+            assert_eq!(*unlocked, *data_key, "key {id}");
+        }
+    }
+
+    #[test]
+    fn revoking_down_to_one_key_then_stopping() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault.enroll(&data_key, &enrollment(2, KEK_B)).unwrap();
+
+        vault
+            .revoke(&data_key, &credential(2).credential_id)
+            .unwrap();
+        assert_eq!(vault.credentials().len(), 1);
+        // The guard must hold on the last one however we got there.
+        assert!(matches!(
+            vault.revoke(&data_key, &credential(1).credential_id),
+            Err(VaultError::LastCredential)
+        ));
+        assert_eq!(vault.credentials().len(), 1);
+    }
+
     // ---------- kv mode (M4) ----------
 
     fn new_kv_vault(dir: &TempDir) -> (PathBuf, Vault, Zeroizing<[u8; 32]>) {
@@ -1463,7 +1769,9 @@ mod tests {
     fn revoke_rejects_the_last_credential() {
         let dir = TempDir::new().unwrap();
         let (_, mut vault) = new_vault(&dir, Mode::File);
-        let data_key = Zeroizing::new([0u8; 32]);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
         let err = vault
             .revoke(&data_key, &credential(1).credential_id)
             .unwrap_err();
@@ -1474,30 +1782,28 @@ mod tests {
     fn revoke_rejects_an_unknown_credential() {
         let dir = TempDir::new().unwrap();
         let (_, mut vault) = new_vault(&dir, Mode::File);
-        let data_key = Zeroizing::new([0u8; 32]);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
         let err = vault.revoke(&data_key, &[0xFF]).unwrap_err();
         assert!(matches!(err, VaultError::UnknownCredential), "got {err:?}");
     }
 
     #[test]
-    fn later_milestones_report_themselves_as_unimplemented() {
+    fn enroll_and_revoke_refuse_a_wrong_data_key() {
+        // Both act on header contents, so both must verify the MAC before doing
+        // anything at all (plan/03's ordering).
         let dir = TempDir::new().unwrap();
         let (_, mut vault) = new_vault(&dir, Mode::File);
-        let data_key = vault
-            .unlock_with(&credential(1).credential_id, kek(KEK_A))
-            .unwrap();
+        let wrong = Zeroizing::new([0u8; 32]);
 
         assert!(matches!(
-            vault.enroll(&data_key, &enrollment(2, KEK_B)),
-            Err(VaultError::NotImplemented(_))
+            vault.enroll(&wrong, &enrollment(2, KEK_B)),
+            Err(VaultError::AuthenticationFailed)
         ));
         assert!(matches!(
-            vault.kv_get(&data_key, "name"),
-            Err(VaultError::NotImplemented(_))
-        ));
-        assert!(matches!(
-            vault.kv_set(&data_key, "name", b"value"),
-            Err(VaultError::NotImplemented(_))
+            vault.revoke(&wrong, &credential(1).credential_id),
+            Err(VaultError::AuthenticationFailed)
         ));
     }
 
