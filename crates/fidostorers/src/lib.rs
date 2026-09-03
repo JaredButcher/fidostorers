@@ -5,10 +5,12 @@
 //! data key as a plain byte array. That split is what keeps this crate's tests
 //! hardware-free — see plan/02-crate-fidostorers.md and plan/05-testing-strategy.md.
 
+mod archive;
 mod crypto;
 mod error;
 mod vault;
 
+pub use archive::{ExtractReport, SkippedEntry};
 pub use crypto::kek_from_secret;
 pub use error::VaultError;
 pub use vault::{CredentialEntry, Enrollment, Mode, Vault, FORMAT_VERSION};

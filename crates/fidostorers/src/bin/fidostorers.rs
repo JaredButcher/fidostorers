@@ -1,7 +1,7 @@
 //! `fidostorers` CLI. See plan/02-crate-fidostorers.md.
 //!
-//! `init`, `lock`, `unlock`, and `info` are wired end to end for file mode (M2).
-//! `enroll`/`revoke` (M5), directory mode (M3), and kv mode (M4) still bottom out in
+//! `init`, `lock`, `unlock`, and `info` are wired end to end for file mode (M2) and
+//! directory mode (M3). `enroll`/`revoke` (M5) and kv mode (M4) still bottom out in
 //! `NotImplemented` — see plan/06-roadmap.md.
 //!
 //! This binary is where the two halves meet: it asks `fido-token` for an
@@ -22,6 +22,14 @@ use zeroize::Zeroizing;
 
 const DEFAULT_RP_ID: &str = "fidostorers.local";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// Generic failure.
+const EXIT_ERROR: i32 = 1;
+/// The vault was decrypted and extracted, but the tree on disk is **incomplete** —
+/// typically a symlink that Windows would not let us create. Distinct from both
+/// success and a hard error so a script can tell the difference, as plan/07 #8
+/// requires.
+const EXIT_INCOMPLETE_EXTRACTION: i32 = 20;
 
 #[derive(Parser)]
 #[command(
@@ -193,20 +201,16 @@ fn unlock_vault(vault: &Vault, require_uv: bool) -> Result<Zeroizing<[u8; 32]>> 
     }
 }
 
-/// `lock`/`unlock` only know file mode today. Directory mode is M3 and kv mode M4,
-/// so say which milestone rather than a bare "unsupported".
+/// `lock`/`unlock` know file and dir mode; kv is M4, and is reached through the
+/// `kv` subcommand rather than these two anyway.
 fn not_yet_supported(mode: Mode) -> anyhow::Error {
-    let milestone = match mode {
-        Mode::Dir => "M3",
-        Mode::Kv => "M4",
-        Mode::File => unreachable!("file mode is implemented"),
-    };
     anyhow::anyhow!(
-        "this is a {mode} vault; {mode} mode lands in {milestone}, see plan/06-roadmap.md"
+        "this is a {mode} vault; use `fidostorers kv` for it — kv mode lands in M4, \
+         see plan/06-roadmap.md"
     )
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<i32> {
     match Cli::parse().command {
         Commands::Init {
             vault,
@@ -268,6 +272,11 @@ fn run() -> Result<()> {
                     vault.seal_file(&data_key, &input)?;
                     println!("locked {input:?} into {path:?}");
                 }
+                Mode::Dir => {
+                    let data_key = unlock_vault(&vault, require_uv)?;
+                    vault.seal_dir(&data_key, &input)?;
+                    println!("locked the tree at {input:?} into {path:?}");
+                }
                 mode => return Err(not_yet_supported(mode)),
             }
         }
@@ -282,6 +291,43 @@ fn run() -> Result<()> {
                     let data_key = unlock_vault(&vault, require_uv)?;
                     vault.open_file(&data_key, &output)?;
                     println!("unlocked {path:?} into {output:?}");
+                }
+                Mode::Dir => {
+                    let data_key = unlock_vault(&vault, require_uv)?;
+                    let report = vault.open_dir(&data_key, &output)?;
+                    println!(
+                        "unlocked {path:?} into {output:?} ({} entries)",
+                        report.extracted
+                    );
+                    if report.modes_ignored {
+                        eprintln!(
+                            "warning: this platform has no Unix mode bits; permissions in \
+                             the archive were not applied. They are still stored, and \
+                             extracting on Linux restores them."
+                        );
+                    }
+                    if !report.is_complete() {
+                        for skipped in &report.skipped {
+                            eprintln!(
+                                "warning: skipped {}: {}",
+                                skipped.path.display(),
+                                skipped.reason
+                            );
+                        }
+                        eprintln!(
+                            "\n{} of {} entries could not be created, so the extracted tree \
+                             is INCOMPLETE.",
+                            report.skipped.len(),
+                            report.skipped.len() + report.extracted
+                        );
+                        if cfg!(windows) {
+                            eprintln!(
+                                "On Windows, creating symlinks needs Developer Mode (Settings > \
+                                 Privacy & security > For developers) or an elevated terminal."
+                            );
+                        }
+                        return Ok(EXIT_INCOMPLETE_EXTRACTION);
+                    }
                 }
                 mode => return Err(not_yet_supported(mode)),
             }
@@ -330,13 +376,16 @@ fn run() -> Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(0)
 }
 
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("error: {err:#}");
-        std::process::exit(1);
+    match run() {
+        Ok(code) => std::process::exit(code),
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            std::process::exit(EXIT_ERROR);
+        }
     }
 }
 

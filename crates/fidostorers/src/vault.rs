@@ -37,6 +37,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::archive::{self, ExtractReport};
 use crate::crypto;
 use crate::VaultError;
 
@@ -484,28 +485,33 @@ impl Vault {
         Ok(())
     }
 
-    /// (mode = Dir) Archive `input_dir` and encrypt it into this vault.
+    /// (mode = Dir) Archive `input_dir` into a tar stream and encrypt it into this
+    /// vault. Symlinks are stored as symlinks, never followed; Unix mode bits are
+    /// preserved (plan/07 #8).
     pub fn seal_dir(
         &mut self,
         data_key: &Zeroizing<[u8; 32]>,
         input_dir: &Path,
     ) -> Result<(), VaultError> {
-        let _ = (data_key, input_dir);
-        Err(VaultError::NotImplemented(
-            "directory sealing lands in M3, see plan/06-roadmap.md",
-        ))
+        self.expect_mode(Mode::Dir)?;
+        let tar = Zeroizing::new(archive::build(input_dir)?);
+        self.seal_payload(data_key, &tar)
     }
 
     /// (mode = Dir) Decrypt and extract this vault's payload into `output_dir`.
+    ///
+    /// Extraction is best-effort per platform, so this returns an
+    /// [`ExtractReport`] rather than `()`: on Windows a symlink may be
+    /// unreproducible, and the caller has to be able to tell a partial extraction
+    /// from a complete one. Check [`ExtractReport::is_complete`].
     pub fn open_dir(
         &self,
         data_key: &Zeroizing<[u8; 32]>,
         output_dir: &Path,
-    ) -> Result<(), VaultError> {
-        let _ = (data_key, output_dir);
-        Err(VaultError::NotImplemented(
-            "directory opening lands in M3, see plan/06-roadmap.md",
-        ))
+    ) -> Result<ExtractReport, VaultError> {
+        self.expect_mode(Mode::Dir)?;
+        let tar = self.open_payload(data_key)?;
+        archive::extract(&tar, output_dir)
     }
 
     /// (mode = Kv) Set (inserting or overwriting) one entry.
@@ -1113,6 +1119,138 @@ mod tests {
         });
     }
 
+    // ---------- directory mode (M3) ----------
+
+    #[test]
+    fn dir_round_trip_through_a_vault() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tree.fido");
+        let mut vault = Vault::create(&path, Mode::Dir, &enrollment(1, KEK_A)).unwrap();
+
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("nested/deeper")).unwrap();
+        std::fs::create_dir(src.join("empty")).unwrap();
+        std::fs::write(src.join("one.txt"), b"first").unwrap();
+        std::fs::write(src.join("nested/deeper/two.bin"), [9u8; 100]).unwrap();
+
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault.seal_dir(&data_key, &src).unwrap();
+
+        let reopened = Vault::open(&path).unwrap();
+        let data_key = reopened
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        let out = dir.path().join("out");
+        let report = reopened.open_dir(&data_key, &out).unwrap();
+
+        assert!(report.is_complete(), "{:?}", report.skipped);
+        assert_eq!(std::fs::read(out.join("one.txt")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(out.join("nested/deeper/two.bin")).unwrap(),
+            [9u8; 100]
+        );
+        assert!(out.join("empty").is_dir());
+    }
+
+    #[test]
+    fn a_sealed_tree_is_not_readable_from_the_vault_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tree.fido");
+        let mut vault = Vault::create(&path, Mode::Dir, &enrollment(1, KEK_A)).unwrap();
+
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("secret.txt"), b"MOST-SECRET-VALUE").unwrap();
+
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault.seal_dir(&data_key, &src).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        // Neither the contents nor the file names may appear in the clear: a tar
+        // stores names in plaintext, so this checks the payload really is encrypted.
+        for needle in [&b"MOST-SECRET-VALUE"[..], &b"secret.txt"[..]] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle),
+                "{:?} appears verbatim in the vault file",
+                String::from_utf8_lossy(needle)
+            );
+        }
+    }
+
+    #[test]
+    fn dir_operations_refuse_a_file_vault() {
+        let dir = TempDir::new().unwrap();
+        let (_, mut vault) = new_vault(&dir, Mode::File);
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+
+        assert!(matches!(
+            vault.seal_dir(&data_key, &src),
+            Err(VaultError::WrongMode {
+                expected: Mode::Dir,
+                found: Mode::File
+            })
+        ));
+        assert!(matches!(
+            vault.open_dir(&data_key, &dir.path().join("out")),
+            Err(VaultError::WrongMode { .. })
+        ));
+    }
+
+    #[test]
+    fn sealing_a_missing_directory_leaves_the_vault_intact() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tree.fido");
+        let mut vault = Vault::create(&path, Mode::Dir, &enrollment(1, KEK_A)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        let err = vault
+            .seal_dir(&data_key, &dir.path().join("nope"))
+            .unwrap_err();
+        assert!(matches!(err, VaultError::NotADirectory(_)), "got {err:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_tree_round_trips_through_a_vault() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("tree.fido");
+        let mut vault = Vault::create(&path, Mode::Dir, &enrollment(1, KEK_A)).unwrap();
+
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("real.txt"), b"real contents").unwrap();
+        std::os::unix::fs::symlink("real.txt", src.join("alias.txt")).unwrap();
+
+        let data_key = vault
+            .unlock_with(&credential(1).credential_id, kek(KEK_A))
+            .unwrap();
+        vault.seal_dir(&data_key, &src).unwrap();
+
+        let out = dir.path().join("out");
+        let report = vault.open_dir(&data_key, &out).unwrap();
+        assert!(report.is_complete(), "{:?}", report.skipped);
+        assert!(std::fs::symlink_metadata(out.join("alias.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read(out.join("alias.txt")).unwrap(),
+            b"real contents"
+        );
+    }
+
     // ---------- mode parsing ----------
 
     #[test]
@@ -1162,7 +1300,7 @@ mod tests {
             Err(VaultError::NotImplemented(_))
         ));
         assert!(matches!(
-            vault.seal_dir(&data_key, dir.path()),
+            vault.kv_set(&data_key, "name", b"value"),
             Err(VaultError::NotImplemented(_))
         ));
     }

@@ -98,14 +98,32 @@ did not survive contact, all recorded there in full:
    revisiting for M3, where a directory tree could be large.
 
 ## M3 — Directory mode
-- `tar`-based archive/extract, `lock`/`unlock` extended to `dir` mode.
-- Directory round-trip tests incl. nested dirs, symlinks, empty dirs.
-- Implement the symlink/permission policy settled in
+
+**Code: done. Hardware and Windows validation: outstanding.**
+
+- [x] `tar`-based archive/extract, `lock`/`unlock` extended to `dir` mode.
+- [x] Directory round-trip tests incl. nested dirs, symlinks, empty dirs, a symlink
+  cycle, and a read-only directory whose children still have to be written.
+- [x] The symlink/permission policy settled in
   [07-open-decisions.md](07-open-decisions.md) #8: full-fidelity archive everywhere,
-  best-effort extraction, per-entry warnings on Windows, non-zero exit when anything
-  was skipped.
-- Manual check on Windows both with and without Developer Mode enabled, since that
-  toggle is what decides whether symlink extraction works at all.
+  best-effort extraction, per-entry warnings, and exit code 20 when anything was
+  skipped.
+- [ ] Manual check on Windows both with and without Developer Mode enabled, since
+  that toggle is what decides whether symlink extraction works at all. This is the
+  one part of #8 that unit tests on Linux structurally cannot cover — the skip path
+  is exercised by a synthetic test, but not by a real Windows refusal.
+
+### Refinements to the plan made while implementing
+
+1. **`open_dir` returns an `ExtractReport`, not `()`.** #8 requires a distinct
+   non-zero exit when extraction skipped anything, and `()` cannot carry that. The
+   report names every skipped entry and its reason, and flags whether mode bits were
+   discarded.
+2. **Archive paths are treated as hostile.** The plan's threat model did not consider
+   a vault *authored* by an attacker, which is a real case: someone can hand you a
+   vault and a key that opens it. Extraction now rejects absolute paths, `..`
+   traversal, and the symlink-then-write-through-it escape. See
+   [04-security-and-threat-model.md](04-security-and-threat-model.md).
 
 ## M4 — KV mode
 - `kv set/get/rm/ls`.

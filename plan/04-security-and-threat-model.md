@@ -32,6 +32,31 @@ audit. Revisit before any real-world sensitive use.
 - **Side-channel/physical attacks on the authenticator itself**: out of scope; that's
   the authenticator vendor's problem.
 
+## Hostile vault contents (added in M3)
+
+The threat model above considers an attacker who *obtains* a vault. It did not
+consider one who *authors* it — but nothing stops someone handing you a vault file
+along with a key that opens it, and "open this, it's the shared credentials" is an
+entirely ordinary-sounding request.
+
+Authentication does not help here. `header_mac` and the AEAD tags prove the vault has
+not been altered since it was sealed; they say nothing about whether the person who
+sealed it meant you well. So for directory mode, where the payload names paths on
+your filesystem, entry paths are treated as untrusted input:
+
+- Absolute paths, `..` components, and Windows path prefixes are rejected outright.
+- Every entry's parent directory is canonicalized and checked to be inside the output
+  directory *before* anything is written. This is what catches the two-step escape —
+  an archive storing a symlink `escape -> /etc` and then an entry `escape/passwd`,
+  where every individual path component is innocuous.
+- Regular files are removed before being written, so an extraction never writes
+  *through* a symlink left by an earlier entry or already present in the output tree.
+
+What is still **not** defended against, deliberately: a vault whose contents are
+merely enormous (a decompression-style bomb). Extraction is bounded by disk, not by a
+policy limit. Anyone who can get you to unlock their vault can also just send you a
+large file, so this is not the interesting attack.
+
 ## In-process secret hygiene
 
 - All key material (`secret_i`, `KEK_i`, data key, decrypted KV values) is held in

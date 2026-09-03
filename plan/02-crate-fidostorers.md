@@ -60,6 +60,22 @@ live touch, by design — this is the whole point (see
 [04-security-and-threat-model.md](04-security-and-threat-model.md)). There is no
 "remember me" / cached-secret mode in v1.
 
+### Exit codes
+
+`fido-token` has its own richer table ([01-crate-fido-token.md](01-crate-fido-token.md));
+this crate needs far less, because a failed touch is already reported there.
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | error (the message says which) |
+| 20 | **the vault was decrypted, but the extracted tree is incomplete** |
+
+Code 20 exists because of [07-open-decisions.md](07-open-decisions.md) #8: on Windows
+a symlink may be unreproducible, and "mostly extracted" must be distinguishable from
+both success and failure so a script can detect a partial tree rather than trusting a
+silent success. Every skipped entry is named on stderr with its reason before it.
+
 ## KV mode trade-off (documented, not hidden)
 
 Storing every KV entry inside one AEAD-encrypted blob means any single `kv set` or

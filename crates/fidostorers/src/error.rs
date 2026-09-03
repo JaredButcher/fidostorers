@@ -29,6 +29,15 @@ pub enum VaultError {
     #[error("header is {len} bytes, over the {max}-byte limit (too many enrolled credentials?)")]
     HeaderTooLarge { len: usize, max: usize },
 
+    #[error("{0} is not a directory")]
+    NotADirectory(std::path::PathBuf),
+
+    #[error("malformed archive: {0}")]
+    MalformedArchive(String),
+
+    #[error("refusing to extract an unsafe archive path: {0}")]
+    UnsafeArchivePath(String),
+
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
 

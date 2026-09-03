@@ -29,6 +29,8 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # Used for the temp-file-then-rename write path, so a crash mid-write cannot
 # corrupt an existing vault (plan/02, "Crash safety").
 tempfile = "3"
+# Directory-mode archiving. Streams well and avoids inventing an archive format.
+tar = "0.4"
 log = "0.4"
 env_logger = "0.11"
 rpassword = "7"
