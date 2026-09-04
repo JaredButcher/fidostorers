@@ -154,8 +154,8 @@ collision that actually happens. It does not stop unrelated programs.
 
 If a session is killed, the stale lock is cleared automatically the next time you
 open that vault on the same machine. Where liveness cannot be checked — a lock
-recorded by another machine, or on Windows — use `open <vault> --force`, which tells
-you whose lock you are taking.
+recorded by another machine, or a process this one is not allowed to query — use
+`open <vault> --force`, which tells you whose lock you are taking.
 
 ## If a session is killed
 

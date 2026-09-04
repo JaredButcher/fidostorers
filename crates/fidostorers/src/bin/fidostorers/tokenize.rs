@@ -8,6 +8,20 @@
 //! Deliberately a small subset of shell quoting: single quotes, double quotes, and
 //! backslash escapes. No expansion of variables, globs, or `~`, because a REPL that
 //! silently rewrote an argument would be worse than one that took it literally.
+//!
+//! A backslash escapes only a quote, another backslash, or whitespace. Before
+//! anything else it is a literal backslash, so a Windows path pasted without quotes
+//! arrives intact. Treating every backslash as an escape is what a unix shell does,
+//! and on Windows it silently turns `C:\Users\me\vault.fido` into
+//! `C:Usersmevault.fido` — a wrong path, reported much later as "file not found".
+
+/// Which characters a backslash may escape.
+///
+/// Deliberately short: a backslash before anything else is a literal backslash, so
+/// Windows paths survive being typed without quotes.
+fn is_escapable(c: char) -> bool {
+    c == '"' || c == '\'' || c == '\\' || c.is_whitespace()
+}
 
 /// Split `line` into arguments, honouring quotes and backslash escapes.
 ///
@@ -62,9 +76,21 @@ pub fn tokenize(line: &str) -> Result<Vec<String>, String> {
             }
             '\\' => {
                 have_token = true;
-                match chars.next() {
-                    Some(escaped) => current.push(escaped),
-                    None => return Err("line ends with a trailing backslash".to_string()),
+                // Only characters that actually need escaping are consumed;
+                // anything else keeps its backslash. This is what makes
+                // `open C:\Users\me\vault.fido` a path rather than a mangled
+                // escape sequence, which matters because on Windows an unquoted
+                // backslash is a path separator far more often than it is an
+                // escape — and silently eating it is worse than refusing it.
+                // Same rule as inside double quotes, below.
+                match chars.peek() {
+                    Some(&next) if is_escapable(next) => {
+                        current.push(next);
+                        chars.next();
+                    }
+                    // A trailing backslash, or one before an ordinary character,
+                    // is just a backslash. A directory path may well end in one.
+                    _ => current.push('\\'),
                 }
             }
             c => {
@@ -131,8 +157,28 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_backslash_escapes_the_next_character() {
+    fn a_bare_backslash_escapes_only_what_needs_it() {
         assert_eq!(split(r"a\ b"), ["a b"]);
+        assert_eq!(split(r"a\\b"), [r"a\b"]);
+        assert_eq!(split(r#"say\"hi"#), [r#"say"hi"#]);
+    }
+
+    #[test]
+    fn an_unquoted_windows_path_survives() {
+        // The regression this exists for: treating every backslash as an escape
+        // turned `C:\Users\me\vault.fido` into `C:Usersmevault.fido`, which
+        // surfaced much later as "the system cannot find the file specified".
+        assert_eq!(
+            split(r"open C:\Users\me\vault.fido"),
+            ["open", r"C:\Users\me\vault.fido"]
+        );
+        // Including a trailing separator, which a directory path may well have.
+        assert_eq!(split(r"--work-dir C:\work\"), ["--work-dir", r"C:\work\"]);
+        // And a path whose next character would have been a plausible escape.
+        assert_eq!(
+            split(r"open C:\temp\new\v.fido"),
+            ["open", r"C:\temp\new\v.fido"]
+        );
     }
 
     #[test]
@@ -164,6 +210,5 @@ mod tests {
     fn unterminated_quotes_are_an_error_not_a_silent_truncation() {
         assert!(tokenize(r#"open "vault.fido"#).is_err());
         assert!(tokenize("open 'vault.fido").is_err());
-        assert!(tokenize(r"open vault\").is_err());
     }
 }

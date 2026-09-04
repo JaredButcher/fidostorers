@@ -69,7 +69,23 @@ libc = "0.2"
 # the crate fails to compile for Windows on its own. Declaring winapi here with
 # `std` turns it on graph-wide via feature unification. Remove once the upstream
 # crate enables it itself. See docs/M1-MANUAL-TESTING.md.
-winapi = { version = "0.3.9", features = ["std", "memoryapi", "sysinfoapi", "minwindef", "basetsd"] }
+# Features are listed explicitly for everything this workspace calls, rather than
+# relying on them arriving transitively through another feature's dependencies:
+# `memoryapi`/`sysinfoapi` for VirtualLock and GetSystemInfo (M11), and
+# `processthreadsapi`/`handleapi`/`minwinbase`/`winerror` for the OpenProcess
+# liveness check that vault locks and orphan recovery depend on.
+winapi = { version = "0.3.9", features = [
+    "std",
+    "memoryapi",
+    "sysinfoapi",
+    "minwindef",
+    "basetsd",
+    "processthreadsapi",
+    "handleapi",
+    "minwinbase",
+    "winnt",
+    "winerror",
+] }
 
 # SIGTERM/SIGHUP must run the same graceful shutdown as `exit` (plan/08, "Shutdown"),
 # and std exposes no way to catch them. Unix only: Windows has no SIGTERM, and

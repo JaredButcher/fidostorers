@@ -370,8 +370,7 @@ out of the first working version.
    Same host, and no such process. "I cannot tell" — another machine's pid, or a
    platform with no liveness check — is not staleness, and neither is a lock file
    too corrupt to parse; both need `open --force`. Linux answers liveness from
-   `/proc`; Windows would need `OpenProcess` and a dependency to spare the user one
-   `--force`, so it answers "unknown" instead.
+   `/proc`, Windows from `OpenProcess` (see the correction below).
 9. **Ctrl+C cancellation is real but narrow.** plan/08's table says a Ctrl+C during
    a long operation cancels it. Nothing in a vault write is safely interruptible, and
    an Argon2 run or a device touch cannot be aborted mid-flight — so the flag is
@@ -515,6 +514,26 @@ the Windows caveat below.
    Windows cannot suppress dumps at all. Both are probed and printed, because "we
    tried to lock memory" and "memory is locked" are different claims and only the
    second is worth making to a user deciding whether to trust a session.
+
+### Corrections after Windows CI
+
+Two things only the Windows half of the matrix could find, both fixed after M11:
+
+1. **The REPL tokenizer ate Windows paths.** Outside quotes it treated every
+   backslash as an escape, so `open C:\Users\me\vault.fido` became
+   `C:Usersmevault.fido` and failed as "the system cannot find the file specified"
+   — and because `open` failed before `--password-stdin` consumed it, the password
+   line then arrived as a command. A backslash now escapes only a quote, another
+   backslash, or whitespace, which is the rule the double-quoted branch already
+   used; anything else keeps its backslash. Unix `a\ b` still works.
+2. **Orphan recovery never triggered on Windows.** `orphan::find` only offers a
+   working directory whose owning process is *provably* gone, and Windows answered
+   "cannot tell" for every pid — so a killed session left its plaintext on disk and
+   was never offered it back. This is the consequence of #23 that its original
+   reasoning missed. `process_is_alive` is now implemented there via `OpenProcess`
+   + `GetExitCodeProcess`.
+
+Both are covered by tests that run on the Windows half of the matrix.
 
 ### New dependencies
 

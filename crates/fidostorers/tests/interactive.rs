@@ -83,7 +83,7 @@ fn session(vault: &Path, keyfile: &Path, open_args: &str, script: &str) -> (Stri
     let mut child = spawn_session(&runtime);
 
     let input = format!(
-        "open {} {open_args} --keyfile {} --password-stdin\n{PASSWORD}\n{script}\nexit\n",
+        "open \"{}\" {open_args} --keyfile \"{}\" --password-stdin\n{PASSWORD}\n{script}\nexit\n",
         vault.display(),
         keyfile.display()
     );
@@ -117,7 +117,7 @@ fn session_with_edit(
     stdin
         .write_all(
             format!(
-                "open {} --work-dir {} --keyfile {} --password-stdin\n{PASSWORD}\n",
+                "open \"{}\" --work-dir \"{}\" --keyfile \"{}\" --password-stdin\n{PASSWORD}\n",
                 vault.display(),
                 work.display(),
                 keyfile.display()
@@ -412,7 +412,7 @@ fn an_unchanged_store_is_not_rewritten() {
     let (stdout, _) = session(
         &vault,
         &keyfile,
-        &format!("--work-dir {}", work.display()),
+        &format!("--work-dir \"{}\"", work.display()),
         "stores",
     );
 
@@ -473,7 +473,7 @@ fn work_dir_refuses_a_directory_that_is_not_empty() {
     let (_, stderr) = session(
         &vault,
         &keyfile,
-        &format!("--work-dir {}", work.display()),
+        &format!("--work-dir \"{}\"", work.display()),
         "stores",
     );
     assert!(stderr.contains("is not empty"), "{stderr}");
@@ -491,7 +491,7 @@ fn a_kv_store_rejects_a_work_dir() {
     let (_, stderr) = session(
         &vault,
         &keyfile,
-        &format!("--work-dir {}", dir.path().join("w").display()),
+        &format!("--work-dir \"{}\"", dir.path().join("w").display()),
         "stores",
     );
     assert!(stderr.contains("no working directory"), "{stderr}");
@@ -589,7 +589,7 @@ fn a_running_session_pins_its_data_key() {
     stdin
         .write_all(
             format!(
-                "open {} --keyfile {} --password-stdin\n{PASSWORD}\n",
+                "open \"{}\" --keyfile \"{}\" --password-stdin\n{PASSWORD}\n",
                 vault.display(),
                 keyfile.display()
             )

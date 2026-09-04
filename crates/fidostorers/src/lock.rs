@@ -194,8 +194,8 @@ fn busy(vault: &Path, holder: Option<LockInfo>) -> VaultError {
 /// Whether this lock can be cleared without asking anyone.
 ///
 /// Only a holder we can *prove* is gone qualifies. "I cannot tell" is not staleness:
-/// a lock recorded on another machine, or on a platform with no liveness check,
-/// stays until the user says otherwise with `--force`.
+/// a lock recorded on another machine, or one naming a process we are not allowed
+/// to query, stays until the user says otherwise with `--force`.
 fn is_stale(info: &LockInfo) -> bool {
     is_definitely_gone(info.pid, &info.hostname)
 }
@@ -210,22 +210,62 @@ pub(crate) fn is_definitely_gone(pid: u32, host: &str) -> bool {
     host == hostname() && process_is_alive(pid) == Some(false)
 }
 
-/// `Some(false)` only when the answer is certain.
+/// `Some(false)` only when the answer is certain; `None` when it cannot be known.
 ///
-/// Linux can answer from `/proc`. Windows would need `OpenProcess`, which means a
-/// dependency purely to make `--force` unnecessary in one case, so it returns
-/// `None` and the user is told to pass `--force` instead. Claiming a process is
-/// dead when we cannot check would steal a live session's lock.
+/// Claiming a process is dead when we cannot check would steal a live session's lock
+/// and offer up a working directory it is still editing, so "I cannot tell" must
+/// stay distinguishable from "gone".
+#[cfg(target_os = "linux")]
 fn process_is_alive(pid: u32) -> Option<bool> {
-    #[cfg(target_os = "linux")]
-    {
-        Some(Path::new(&format!("/proc/{pid}")).exists())
+    Some(Path::new(&format!("/proc/{pid}")).exists())
+}
+
+/// Windows, via `OpenProcess`.
+///
+/// This was originally left unimplemented, on the reasoning that it would only save
+/// the user an occasional `--force`. That was wrong: [`crate::orphan`] decides
+/// whether a crashed session's **plaintext working directory** may be recovered
+/// using the same predicate, so returning "I cannot tell" here meant a killed
+/// session on Windows left its plaintext on disk and never offered it back.
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> Option<bool> {
+    use winapi::shared::winerror::ERROR_INVALID_PARAMETER;
+    use winapi::um::handleapi::CloseHandle;
+    use winapi::um::minwinbase::STILL_ACTIVE;
+    use winapi::um::processthreadsapi::{GetExitCodeProcess, OpenProcess};
+    use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
+
+    // SAFETY: a valid access mask and pid; the handle is closed on every path.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        // A pid that does not exist is reported as an invalid parameter. Anything
+        // else — access denied for a process owned by someone else, most likely —
+        // means it does exist, or that we simply cannot say.
+        return if code == ERROR_INVALID_PARAMETER as i32 {
+            Some(false)
+        } else {
+            None
+        };
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
+
+    let mut status: u32 = 0;
+    // SAFETY: `handle` is a live process handle and `status` is a valid out param.
+    let queried = unsafe { GetExitCodeProcess(handle, &mut status) };
+    // SAFETY: closing a handle we opened, exactly once.
+    unsafe { CloseHandle(handle) };
+
+    if queried == 0 {
+        return None;
     }
+    // A handle can outlive the process it names, so "opened successfully" is not
+    // the same as "running": ask for the exit code and let STILL_ACTIVE decide.
+    Some(status == STILL_ACTIVE)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn process_is_alive(_pid: u32) -> Option<bool> {
+    None
 }
 
 /// Best effort, and only ever compared against itself, so a wrong answer costs an
@@ -377,6 +417,49 @@ mod tests {
             ensure_available(&vault),
             Err(VaultError::VaultBusy { .. })
         ));
+    }
+
+    /// A pid that has certainly exited. Spawned and reaped, so the answer does not
+    /// depend on guessing a number no process happens to be using.
+    fn reaped_pid() -> u32 {
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+            .expect("spawning cmd");
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit"])
+            .spawn()
+            .expect("spawning sh");
+
+        let pid = child.id();
+        child.wait().expect("waiting for the child");
+        pid
+    }
+
+    #[test]
+    fn this_process_is_never_mistaken_for_a_dead_one() {
+        // The dangerous direction. A false "gone" steals a live session's lock and
+        // offers up a working directory it is still editing, so this must hold on
+        // every platform that can answer at all.
+        assert!(!is_definitely_gone(std::process::id(), &hostname()));
+    }
+
+    #[test]
+    fn a_process_that_has_exited_is_reported_gone() {
+        // And the other direction, which is what makes stale locks clear
+        // themselves and orphaned working directories get offered back. A platform
+        // that cannot tell answers `None`, and `is_definitely_gone` is false there
+        // — so this asserts the capability, not merely the absence of a mistake.
+        let pid = reaped_pid();
+        if process_is_alive(pid).is_none() {
+            return; // this platform genuinely cannot say; nothing to assert
+        }
+        assert!(
+            is_definitely_gone(pid, &hostname()),
+            "a reaped process should be reported gone"
+        );
     }
 
     #[test]
