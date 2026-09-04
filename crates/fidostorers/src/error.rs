@@ -68,6 +68,13 @@ pub enum VaultError {
         found: &'static str,
     },
 
+    #[error("{vault:?} is open in another fidostorers process (pid {pid} on {hostname})")]
+    VaultBusy {
+        vault: std::path::PathBuf,
+        pid: u32,
+        hostname: String,
+    },
+
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
 

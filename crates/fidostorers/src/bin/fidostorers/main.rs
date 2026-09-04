@@ -8,13 +8,18 @@
 //! the resulting KEK to `Vault`. The library never talks to hardware itself
 //! (plan/02-crate-fidostorers.md), so this orchestration lives here and only here.
 
+mod repl;
+mod tokenize;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use fidostorers::{Enrollment, Mode, Vault};
+use fidostorers::{Enrollment, Mode, Vault, VaultLock};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use zeroize::Zeroizing;
@@ -192,6 +197,16 @@ enum Commands {
     Info {
         /// The vault to describe.
         vault: PathBuf,
+    },
+    /// Open a session: unlock vaults once and work with them until you exit.
+    ///
+    /// A session holds each open vault's data key in memory, so one touch covers
+    /// every command against that vault instead of one touch per command. That is
+    /// weaker than the default -- the key is live for as long as the store is open
+    /// -- so stores close automatically once idle.
+    Interactive {
+        #[command(flatten)]
+        args: repl::InteractiveArgs,
     },
 }
 
@@ -475,8 +490,40 @@ fn derive_kek(
     Ok(fidostorers::kek_from_secret(&secret))
 }
 
+/// A request to stop, checked at points where stopping is safe.
+///
+/// Unlocking may try several enrolled factors in turn, each costing a touch or an
+/// Argon2 run, so "stop asking me" needs somewhere to take effect. A one-shot
+/// command has no way to signal one and uses [`Interrupt::none`]; a session hands
+/// over the flag its SIGINT handler sets.
+///
+/// Deliberately consulted only *between* factors. Nothing checks it during a vault
+/// write, because a half-written vault is the one outcome worth avoiding more than
+/// an uninterruptible command.
+pub(crate) struct Interrupt(Option<Arc<AtomicBool>>);
+
+impl Interrupt {
+    pub(crate) fn none() -> Self {
+        Interrupt(None)
+    }
+
+    pub(crate) fn watching(flag: Arc<AtomicBool>) -> Self {
+        Interrupt(Some(flag))
+    }
+
+    fn requested(&self) -> bool {
+        self.0
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+}
+
 /// Recover the vault's data key, by whichever factor the caller selected.
-fn unlock_vault(vault: &Vault, auth: &AuthArgs) -> Result<Zeroizing<[u8; 32]>> {
+fn unlock_vault(
+    vault: &Vault,
+    auth: &AuthArgs,
+    interrupt: &Interrupt,
+) -> Result<Zeroizing<[u8; 32]>> {
     let wanted_id = match &auth.id {
         Some(hex) => Some(from_hex(hex).context("--id must be hex")?),
         None => None,
@@ -514,8 +561,8 @@ fn unlock_vault(vault: &Vault, auth: &AuthArgs) -> Result<Zeroizing<[u8; 32]>> {
     }
 
     match &auth.keyfile {
-        Some(path) => unlock_with_keyfile(vault, &candidates, path, auth.password_stdin),
-        None => unlock_with_security_key(vault, &candidates, auth.require_uv),
+        Some(path) => unlock_with_keyfile(vault, &candidates, path, auth.password_stdin, interrupt),
+        None => unlock_with_security_key(vault, &candidates, auth.require_uv, interrupt),
     }
 }
 
@@ -527,9 +574,13 @@ fn unlock_with_security_key(
     vault: &Vault,
     candidates: &[&fidostorers::FactorEntry],
     require_uv: bool,
+    interrupt: &Interrupt,
 ) -> Result<Zeroizing<[u8; 32]>> {
     let mut last_err = None;
     for entry in candidates {
+        if interrupt.requested() {
+            bail!("cancelled before trying {:?}", entry.label);
+        }
         let Some(credential) = entry.factor.credential() else {
             continue;
         };
@@ -560,12 +611,16 @@ fn unlock_with_keyfile(
     candidates: &[&fidostorers::FactorEntry],
     keyfile: &Path,
     password_stdin: bool,
+    interrupt: &Interrupt,
 ) -> Result<Zeroizing<[u8; 32]>> {
     let hash = fidostorers::keyfile::hash_keyfile(keyfile)?;
     let password = read_password(password_stdin, false)?;
 
     let mut last_err = None;
     for entry in candidates {
+        if interrupt.requested() {
+            bail!("cancelled before trying {:?}", entry.label);
+        }
         let fidostorers::Factor::Keyfile(params) = &entry.factor else {
             continue;
         };
@@ -598,6 +653,17 @@ fn unlock_with_keyfile(
 /// through the `kv` subcommand instead.
 fn wrong_command_for_mode(mode: Mode) -> anyhow::Error {
     anyhow::anyhow!("this is a {mode} vault; use `fidostorers kv` to manage its entries")
+}
+
+/// Take the advisory lock for a command that is going to write.
+///
+/// Only writers take it. A session holds its stores' locks for as long as they are
+/// open, and making `info`, `unlock` or `kv get` fail for that whole time would
+/// trade a real convenience for no protection: reading cannot corrupt anything, and
+/// `Vault::write`'s rename means a reader either sees the old file or the new one.
+/// What the lock prevents is two writers, which is the collision that loses data.
+fn lock_for_write(vault: &Path) -> Result<VaultLock> {
+    Ok(VaultLock::acquire(vault)?)
 }
 
 /// Open a vault and confirm it is a kv vault before asking for a touch — telling
@@ -686,6 +752,7 @@ fn run() -> Result<i32> {
             if vault.exists() {
                 bail!("{vault:?} already exists; refusing to overwrite it");
             }
+            let _lock = lock_for_write(&vault)?;
             let enrollment = build_enrollment(
                 &rp_id,
                 label,
@@ -697,17 +764,7 @@ fn run() -> Result<i32> {
             )?;
             Vault::create(&vault, mode, &enrollment)?;
             println!("created {mode} vault at {vault:?}");
-            match auth {
-                AuthKind::Fido2 => println!(
-                    "WARNING: this vault can only be opened by that security key. Enroll a \
-                     second key you keep somewhere safe, or losing this one destroys the data."
-                ),
-                AuthKind::Keyfile => println!(
-                    "WARNING: this vault can only be opened with that keyfile AND that password. \
-                     Losing either destroys the data. Back the keyfile up somewhere the vault is \
-                     not, and enroll a second factor with `fidostorers enroll`."
-                ),
-            }
+            warn_about_a_single_factor(auth);
         }
         Commands::Enroll {
             vault: path,
@@ -718,11 +775,12 @@ fn run() -> Result<i32> {
             argon2,
             unlock_with,
         } => {
+            let _lock = lock_for_write(&path)?;
             let mut vault = Vault::open(&path)?;
 
             let unlock_with = AuthArgs::from(unlock_with);
             eprintln!("First, unlock with a factor already enrolled in this vault.");
-            let data_key = unlock_vault(&vault, &unlock_with)?;
+            let data_key = unlock_vault(&vault, &unlock_with, &Interrupt::none())?;
 
             eprintln!();
             if auth == AuthKind::Fido2 {
@@ -744,13 +802,7 @@ fn run() -> Result<i32> {
 
             vault.enroll(&data_key, &enrollment)?;
             if auth == AuthKind::Keyfile {
-                eprintln!();
-                eprintln!(
-                    "NOTE: a vault is only as strong as its weakest enrolled factor. A password\n\
-                     can be guessed offline by anyone holding both this vault and its keyfile,\n\
-                     which a security key alone cannot be. Keep the keyfile somewhere the vault\n\
-                     is not, and keep it byte-identical - it cannot be regenerated."
-                );
+                warn_about_weakest_factor();
             }
             println!(
                 "enrolled {label:?}; {path:?} now has {}",
@@ -769,6 +821,7 @@ fn run() -> Result<i32> {
                 (None, None) => bail!("specify which factor to remove with --id (see `info`)"),
             };
             let target = from_hex(&hex).context("--id must be hex")?;
+            let _lock = lock_for_write(&path)?;
             let mut vault = Vault::open(&path)?;
 
             let label = vault
@@ -784,7 +837,7 @@ fn run() -> Result<i32> {
                 .map(|entry| entry.label.clone());
 
             eprintln!("First, unlock with a factor enrolled in this vault.");
-            let data_key = unlock_vault(&vault, &AuthArgs::from(auth))?;
+            let data_key = unlock_vault(&vault, &AuthArgs::from(auth), &Interrupt::none())?;
             vault.revoke(&data_key, &target)?;
 
             let label = label.unwrap_or_else(|| "that factor".to_string());
@@ -792,30 +845,23 @@ fn run() -> Result<i32> {
                 "revoked {label:?}; {path:?} now has {}",
                 plural_factors(vault.credentials().len())
             );
-            eprintln!();
-            eprintln!(
-                "WARNING: this removes the key from THIS file only. The data key itself is\n\
-                 unchanged, so anyone holding both the revoked key and an older copy of this\n\
-                 vault (a backup, a synced folder, git history) can still recover it — and\n\
-                 that same data key still decrypts the current contents. If the revoked key\n\
-                 may be in someone else's hands, create a new vault and re-seal your data\n\
-                 into it rather than relying on this."
-            );
+            warn_revocation_is_not_rekeying();
         }
         Commands::Lock {
             vault: path,
             input,
             auth,
         } => {
+            let _lock = lock_for_write(&path)?;
             let mut vault = Vault::open(&path)?;
             match vault.mode() {
                 Mode::File => {
-                    let data_key = unlock_vault(&vault, &auth)?;
+                    let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
                     vault.seal_file(&data_key, &input)?;
                     println!("locked {input:?} into {path:?}");
                 }
                 Mode::Dir => {
-                    let data_key = unlock_vault(&vault, &auth)?;
+                    let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
                     vault.seal_dir(&data_key, &input)?;
                     println!("locked the tree at {input:?} into {path:?}");
                 }
@@ -830,12 +876,12 @@ fn run() -> Result<i32> {
             let vault = Vault::open(&path)?;
             match vault.mode() {
                 Mode::File => {
-                    let data_key = unlock_vault(&vault, &auth)?;
+                    let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
                     vault.open_file(&data_key, &output)?;
                     println!("unlocked {path:?} into {output:?}");
                 }
                 Mode::Dir => {
-                    let data_key = unlock_vault(&vault, &auth)?;
+                    let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
                     let report = vault.open_dir(&data_key, &output)?;
                     println!(
                         "unlocked {path:?} into {output:?} ({} entries)",
@@ -896,8 +942,9 @@ fn run() -> Result<i32> {
                 // Read the value before touching the key, so a bad --file path fails
                 // immediately instead of after the user has already touched.
                 let value = Zeroizing::new(source.resolve()?);
+                let _lock = lock_for_write(&path)?;
                 let mut vault = open_kv_vault(&path)?;
-                let data_key = unlock_vault(&vault, &auth)?;
+                let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
                 vault.kv_set(&data_key, &name, &value)?;
                 println!("set {name:?} in {path:?}");
             }
@@ -907,7 +954,7 @@ fn run() -> Result<i32> {
                 auth,
             } => {
                 let vault = open_kv_vault(&path)?;
-                let data_key = unlock_vault(&vault, &auth)?;
+                let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
                 let value = vault.kv_get(&data_key, &name)?;
                 // Raw bytes, no trailing newline: values may be binary, and a
                 // caller piping this into another process must get exactly what
@@ -921,49 +968,106 @@ fn run() -> Result<i32> {
                 name,
                 auth,
             } => {
+                let _lock = lock_for_write(&path)?;
                 let mut vault = open_kv_vault(&path)?;
-                let data_key = unlock_vault(&vault, &auth)?;
+                let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
                 vault.kv_rm(&data_key, &name)?;
                 println!("removed {name:?} from {path:?}");
             }
             KvCommands::Ls { vault: path, auth } => {
                 let vault = open_kv_vault(&path)?;
-                let data_key = unlock_vault(&vault, &auth)?;
+                let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
                 for name in vault.kv_ls(&data_key)? {
                     println!("{name}");
                 }
             }
         },
         Commands::Info { vault } => {
-            let vault = Vault::open(&vault)?;
-            // header_mac can only be checked with the data key, which needs a touch.
-            // `info` deliberately requires none, so everything below is unverified
-            // and must be labelled as such (plan/04-security-and-threat-model.md).
-            println!("UNAUTHENTICATED: shown without touching a key, so none of it is");
-            println!("verified. Decide nothing security-relevant from this output.");
-            println!();
-            println!("mode: {}", vault.mode());
-            println!("rp id: {}", vault.rp_id());
-            println!("format version: {}", vault.format_version());
-            println!("enrolled factors:");
-            for entry in vault.credentials() {
-                println!(
-                    "  {}  {:<8} {}",
-                    entry.id_hex(),
-                    entry.factor.kind(),
-                    entry.label
-                );
-            }
-            if vault.credentials().len() == 1 {
-                println!();
-                println!(
-                    "Only one factor can open this vault. If it is lost, the contents are gone"
-                );
-                println!("for good -- `fidostorers enroll` adds a second one.");
-            }
+            // No touch, so no data key, so `header_mac` cannot be checked.
+            print_vault_info(&Vault::open(&vault)?, false);
         }
+        Commands::Interactive { args } => return repl::run(&args),
     }
     Ok(0)
+}
+
+/// Describe a vault.
+///
+/// `authenticated` says whether the caller has already verified `header_mac` under
+/// this vault's data key. The one-shot `info` has not, and cannot without a touch,
+/// so it must label its output as unverified
+/// (plan/04-security-and-threat-model.md). A session has: opening a store unwraps
+/// the data key and verifies the header with it, so the same fields printed there
+/// really are trustworthy, and saying so is not a courtesy but the difference
+/// between two genuinely different guarantees.
+pub(crate) fn print_vault_info(vault: &Vault, authenticated: bool) {
+    if authenticated {
+        println!("verified: this header's MAC was checked when the store was opened.");
+    } else {
+        println!("UNAUTHENTICATED: shown without touching a key, so none of it is");
+        println!("verified. Decide nothing security-relevant from this output.");
+    }
+    println!();
+    println!("mode: {}", vault.mode());
+    println!("rp id: {}", vault.rp_id());
+    println!("format version: {}", vault.format_version());
+    println!("enrolled factors:");
+    for entry in vault.credentials() {
+        println!(
+            "  {}  {:<8} {}",
+            entry.id_hex(),
+            entry.factor.kind(),
+            entry.label
+        );
+    }
+    if vault.credentials().len() == 1 {
+        println!();
+        println!("Only one factor can open this vault. If it is lost, the contents are gone");
+        println!("for good -- `fidostorers enroll` adds a second one.");
+    }
+}
+
+/// Said at `init`, where a vault has exactly one way in and the user is least
+/// likely to be thinking about losing it.
+pub(crate) fn warn_about_a_single_factor(auth: AuthKind) {
+    match auth {
+        AuthKind::Fido2 => println!(
+            "WARNING: this vault can only be opened by that security key. Enroll a \
+             second key you keep somewhere safe, or losing this one destroys the data."
+        ),
+        AuthKind::Keyfile => println!(
+            "WARNING: this vault can only be opened with that keyfile AND that password. \
+             Losing either destroys the data. Back the keyfile up somewhere the vault is \
+             not, and enroll a second factor with `fidostorers enroll`."
+        ),
+    }
+}
+
+/// Said whenever a keyfile factor is added, at the point of use rather than in a
+/// document: adding one *lowers* a vault's security, because any factor opens it
+/// and an attacker picks the cheapest (plan/10).
+pub(crate) fn warn_about_weakest_factor() {
+    eprintln!();
+    eprintln!(
+        "NOTE: a vault is only as strong as its weakest enrolled factor. A password\n\
+         can be guessed offline by anyone holding both this vault and its keyfile,\n\
+         which a security key alone cannot be. Keep the keyfile somewhere the vault\n\
+         is not, and keep it byte-identical - it cannot be regenerated."
+    );
+}
+
+/// Said at every revoke, because the thing people expect revocation to do is the
+/// thing it does not do (plan/04, M5's finding).
+pub(crate) fn warn_revocation_is_not_rekeying() {
+    eprintln!();
+    eprintln!(
+        "WARNING: this removes the key from THIS file only. The data key itself is\n\
+         unchanged, so anyone holding both the revoked key and an older copy of this\n\
+         vault (a backup, a synced folder, git history) can still recover it — and\n\
+         that same data key still decrypts the current contents. If the revoked key\n\
+         may be in someone else's hands, create a new vault and re-seal your data\n\
+         into it rather than relying on this."
+    );
 }
 
 fn main() {
@@ -991,7 +1095,23 @@ fn hint_for(err: &anyhow::Error) -> Option<String> {
     if let Some(err) = err.downcast_ref::<fidostorers::VaultError>() {
         return vault_hint(err);
     }
+    if let Some(err) = err.downcast_ref::<fidostorers::SessionError>() {
+        return session_hint(err);
+    }
     None
+}
+
+fn session_hint(err: &fidostorers::SessionError) -> Option<String> {
+    use fidostorers::SessionError::*;
+    match err {
+        NoSuchStore(_) => Some("Run `stores` to see what is open, or `open <vault>`.".to_string()),
+        AlreadyOpen { alias, .. } => Some(format!(
+            "It is already unlocked in this session as {alias:?}; use that name."
+        )),
+        // A vault error that surfaced through a session is still a vault error, and
+        // its advice is the same one the one-shot commands give.
+        Vault(inner) => vault_hint(inner),
+    }
 }
 
 fn token_hint(err: &fido_token::TokenError) -> String {
@@ -1090,6 +1210,10 @@ fn vault_hint(err: &fidostorers::VaultError) -> Option<String> {
         WrongFactorKind { .. } => "That entry is a different kind of factor. Use --keyfile for \
              a keyfile factor, or omit it for a security key; `fidostorers info` shows which is \
              which."
+            .to_string(),
+        VaultBusy { .. } => "A session or another command has this vault open. Close it there \
+             first. If that process is gone, `fidostorers interactive` can take the vault with \
+             `open <vault> --force`, or you can delete the .lock file beside it."
             .to_string(),
         InvalidEntryName(_) | NotImplemented(_) | Io(_) | Internal(_) => return None,
     })

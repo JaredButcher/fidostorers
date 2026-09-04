@@ -143,28 +143,53 @@ Unchanged: tamper detection. Forging an entry still needs the data key, deleting
 relabelling one is still caught by `header_mac`, and editing a salt or the KDF
 parameters still produces the wrong KEK and fails the wrap tag.
 
-## Planned change: interactive mode weakens two of the above
+## Interactive mode: what a session weakens (M9)
 
-[08-interactive-mode.md](08-interactive-mode.md) plans a long-lived session that keeps
-a vault's data key in memory, so a user touches their key once per vault instead of
-once per command. It reverses two things this document currently asserts, and the
-reversal is deliberate rather than an oversight:
+`fidostorers interactive` ([08-interactive-mode.md](08-interactive-mode.md)) is
+implemented, and it reverses one of this document's standing guarantees. This
+section is written to describe what the tool does **today**, not what is planned.
 
-- **"Every unlocking operation needs a live touch"** and "there is no remember-me /
-  cached-secret mode" ([02-crate-fidostorers.md](02-crate-fidostorers.md)) stop being
-  true inside a session. A data key is held for as long as a store is open, bounded by
-  an idle timeout that defaults to 15 minutes
-  ([07-open-decisions.md](07-open-decisions.md) #18).
-- **Decrypted output on disk** stops being only "what the user explicitly asked to
-  write". Opening a `file` or `dir` store extracts it to a plaintext working directory
-  for the life of the session (#15). This is the larger of the two changes.
+**"Every unlocking operation needs a live touch" is no longer true inside a
+session.** A session holds each open store's data key in memory from `open` until
+`close`, so one touch covers every subsequent command against that vault. The same
+follows for a keyfile factor: one password prompt and one Argon2 run per store, not
+per command. [02-crate-fidostorers.md](02-crate-fidostorers.md)'s "there is no
+remember-me / cached-secret mode" describes the one-shot commands only.
 
-What does *not* change: a vault at rest, with no session running, is exactly as
-protected as before. The weakened window is while a session is open.
+What bounds that window:
 
-This section will be rewritten in place — not merely appended to — when interactive
-mode is implemented. Until then, the guarantees above this heading describe what the
-tool actually does today.
+- **Only the data key is cached** — never the KEK, never the raw `hmac-secret`
+  output, never the password or the keyfile hash. The data key is sufficient for
+  every `Vault` operation and is the narrowest thing that is: it derives nothing for
+  any other vault, and it says nothing about the security key that produced it.
+- **An idle timeout closes stores automatically**, 15 minutes by default
+  ([07-open-decisions.md](07-open-decisions.md) #18). Expiry is a full close — the
+  key is dropped and the vault's lock released — not merely a flag flipped.
+  `--idle-timeout 0` disables it, which is an explicit choice to leave vaults
+  unlocked for the life of the process.
+- **Every key is zeroized on close**, on every path out: `close`, `exit`, EOF,
+  `SIGTERM`/`SIGHUP`, and idle expiry all drop the same `Zeroizing` data key.
+
+**Plaintext on disk has *not* changed yet.** The working directories that would
+extract a `file` or `dir` store to a plaintext path — decision #15, and the larger
+of the two changes this section used to anticipate — are the next milestone. Today a
+`file`/`dir` store can be opened, which caches its key so `info`, `enroll` and
+`revoke` cost no further touches, but nothing is extracted and no plaintext reaches
+the filesystem from a session. `kv` stores never need a working directory at all.
+
+**A session is not yet hardened for the key lifetime it introduces.** `mlock`/
+`VirtualLock` pinning and core-dump suppression are M11 and are not implemented, so
+a session's data keys can be swapped to disk or captured in a crash dump. The CLI
+says so at startup rather than leaving it here, and interactive mode should not be
+described as safe until those land.
+
+**What does not change:** a vault at rest, with no session running, is exactly as
+protected as before. Tamper detection is untouched — a session verifies `header_mac`
+when it opens a store, which makes its `info` output *authenticated*, unlike the
+touchless one-shot `info`. Concurrent writers are excluded by an advisory
+`<vault>.lock`, which the one-shot writing commands honour too; readers are
+deliberately not excluded, since reading cannot corrupt a vault and a session holds
+its lock for minutes at a time.
 
 ## Explicitly deferred (v2+ or "won't do")
 

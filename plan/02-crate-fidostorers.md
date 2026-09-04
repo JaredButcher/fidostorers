@@ -52,6 +52,11 @@ fidostorers kv ls <vault>
     like a successful deletion. The mode check happens before the touch: being told
     you used the wrong subcommand should not cost a key press.
 
+fidostorers interactive [--idle-timeout <secs>] [--idle-warning <secs>]
+    Open a session: unlock vaults once and work with them until you exit. Holds
+    each open store's data key in memory, bounded by an idle timeout (default 15
+    minutes). See [08-interactive-mode.md](08-interactive-mode.md).
+
 fidostorers info <vault>
     Show mode, enrolled credential count/labels, format version — no touch required
     (header is not secret, only the wrapped keys within it, which reveal nothing
@@ -61,8 +66,13 @@ fidostorers info <vault>
 
 Every unlocking operation (`unlock`, `kv get/set/rm/ls`, `enroll`, `revoke`) needs a
 live touch, by design — this is the whole point (see
-[04-security-and-threat-model.md](04-security-and-threat-model.md)). There is no
-"remember me" / cached-secret mode in v1.
+[04-security-and-threat-model.md](04-security-and-threat-model.md)).
+
+**As of M9 that describes the one-shot commands only.** `fidostorers interactive`
+holds a store's data key from `open` to `close`, so one touch covers every command
+against that vault ([08-interactive-mode.md](08-interactive-mode.md)). The window is
+bounded by an idle timeout and the key is never written anywhere; what is given up
+is stated in plan/04's "Interactive mode" section and at the session's own startup.
 
 ### Exit codes
 

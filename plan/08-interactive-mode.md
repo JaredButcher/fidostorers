@@ -4,6 +4,24 @@ A long-lived session that keeps a vault's data key in memory, so a user working 
 one or more vaults touches their security key once per vault rather than once per
 command.
 
+> **Status: the session core is implemented (M9). Working directories are not.**
+>
+> What works today: `open`/`close`/`stores`/`seal`/`info`/`init`/`kv *`/`enroll`/
+> `revoke`/`help`/`exit`, aliases, the idle timeout and its warning, the advisory
+> lock, and graceful shutdown. `kv` stores work end to end.
+>
+> What is deferred to M10, and is described below as though it existed: the
+> **working directories** that extract a `file` or `dir` store to a plaintext path,
+> and everything that depends on them — dirty tracking and the `stores` dirty
+> column, a `seal` that actually writes, orphan recovery and its session file, and
+> interrupting a shutdown that is taking too long. Opening a `file`/`dir` store
+> today caches its key (so `info`, `enroll` and `revoke` need no further touches)
+> but extracts nothing.
+>
+> Deviations from the design below that were deliberate rather than deferred are
+> recorded in [06-roadmap.md](06-roadmap.md) M9, "Refinements made while
+> implementing".
+
 ```
 $ fidostorers interactive
 fidostorers 0.1.0 - type `help`, `exit` to seal everything and quit

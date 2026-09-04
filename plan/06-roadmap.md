@@ -287,26 +287,112 @@ model: [10-keyfile-password-auth.md](10-keyfile-password-auth.md).
 
 ## M9 — Interactive session core
 
+**Code: done. Hardware validation: outstanding.**
+
 The session, without working directories — so `kv` stores work end to end and no
-plaintext reaches disk in this milestone. That ordering keeps the riskiest part (M9)
+plaintext reaches disk in this milestone. That ordering keeps the riskiest part (M10)
 out of the first working version.
 
-- `fidostorers interactive`: REPL over the existing `clap` command definitions,
+- [x] `fidostorers interactive`: REPL over the existing `clap` argument definitions,
   `rustyline` for line editing, **memory-only history** (a persisted history file
   would capture `kv set --value <secret>`).
-- Any number of open stores, each holding only its data key; aliases from file stems.
-- `open`, `close`, `stores`, `seal`, `info`, `kv *`, `enroll`, `revoke`, `exit`.
-- Idle timeout with an injectable clock, default 15 minutes.
-- Graceful shutdown on `exit`, EOF, Ctrl+C, `SIGTERM`, `SIGHUP`, with signals during a
-  write deferred rather than aborting it.
-- Advisory `<vault>.lock`, honoured by the one-shot commands too.
-- Ctrl+D (or `exit`) shuts down gracefully; Ctrl+C cancels the current line or
-  operation, and interrupts a shutdown that is taking too long
+- [x] Any number of open stores, each holding only its data key; aliases from file
+  stems, with `-2` appended on a collision and `--as` to override.
+- [x] `open`, `close`, `stores`, `seal`, `info`, `kv *`, `init`, `enroll`, `revoke`,
+  `help`, `exit`/`quit`.
+- [x] Idle timeout with an injectable clock, default 15 minutes, plus a warning
+  before it fires. Expiry is a full close: key dropped, lock released.
+- [x] Graceful shutdown on `exit`, EOF, `SIGTERM`, `SIGHUP`, with signals during a
+  write deferred rather than aborting it — flags are read *between* commands and
+  never during a `Vault::write`.
+- [x] Advisory `<vault>.lock`, honoured by the one-shot commands that write.
+- [x] Ctrl+D (or `exit`) shuts down gracefully; Ctrl+C cancels the current line, and
+  cancels an in-progress unlock at its next safe point
   ([07-open-decisions.md](07-open-decisions.md) #19).
+- [x] Hardware-free tests: session state and idle timeout against an injected clock,
+  lock acquisition/staleness/release, the line tokenizer, the REPL's `clap`
+  definitions, and nine end-to-end tests that drive the real binary through a
+  keyfile factor — the first tests in the project to exercise a whole session.
+- [ ] Manual check with a physical key: one touch per `open` and no more, and a
+  session left idle past the timeout re-prompting on the next command.
+
+### Refinements made while implementing
+
+1. **The REPL reuses the shared argument *groups*, not the one-shot subcommand
+   enum.** plan/08 asked for the existing `clap` definitions to be reused so the two
+   spellings cannot drift. Reusing `Commands` wholesale would have been the wrong
+   reading: a REPL command names an **open store**, not a path, and carries no
+   unlocking flags at all — offering `kv set <vault> --keyfile ...` inside a session
+   would advertise doing again the thing the session exists to do once. What is
+   genuinely shared is every argument group whose meaning is unchanged (`AuthArgs`,
+   `Argon2Args`, `KvValueSource`, `AuthKind`, `Mode`), so a flag cannot mean two
+   different things, and the help text for `open` is `AuthArgs`' own.
+2. **`seal` has nothing to do yet, and says so.** It exists to flush a working
+   directory, and there are none until M10; every session write (`kv set`, `kv rm`,
+   `enroll`, `revoke`) goes straight through `Vault` to the file as it is made. So
+   there is no dirty flag either — plan/08's `stores` dirty column is deferred to
+   M10 with the thing it describes, rather than shipped as a field that is
+   structurally always `clean`. `seal` is kept as a recognised command that explains
+   this, since a documented command failing as "unknown" would be worse.
+3. **`file` and `dir` stores can be opened, and it is worth doing.** The obvious
+   alternative was to refuse them until working directories exist. But caching the
+   key already pays for itself: `info`, `enroll` and `revoke` on a `dir` vault cost
+   one touch for the session instead of one per command. `open` says plainly that
+   the contents are not extracted.
+4. **Session `info` is authenticated; one-shot `info` is not.** Opening a store
+   unwraps the data key and verifies `header_mac` with it, so the same fields really
+   are trustworthy there. The two callers share one printer that takes an
+   `authenticated` flag, because the difference is a genuine change in guarantee and
+   printing "UNAUTHENTICATED" in a session would be a lie in the safe direction.
+5. **Memory-only history is structural, not a promise.** `rustyline` is declared
+   with `default-features = false`, which drops `with-file-history` and makes
+   `DefaultHistory` an in-memory type with no way to reach disk. plan/08 asked for
+   memory-only history; a type that *cannot* write beats remembering never to call
+   `save_history`.
+6. **`--stdin` and `--password-stdin` are refused where stdin is the prompt.**
+   `kv set --stdin` inside a session would consume the rest of the user's input, so
+   it is rejected outright. `--password-stdin` is rejected only when stdin is a
+   terminal — where it would read an *echoed* line, defeating the no-echo prompt —
+   and still works for the piped scripting case it was built for.
+7. **Only writers take the advisory lock.** plan/08 asked for the one-shot commands
+   to honour it. Applying it to readers as well would have made `info`, `unlock` and
+   `kv get` fail for as long as a session held a vault open, which is minutes or
+   hours, in exchange for nothing: reading cannot corrupt a vault, and
+   `Vault::write`'s rename means a reader sees either the whole old file or the
+   whole new one.
+8. **A lock is only cleared automatically when its holder is *provably* gone.**
+   Same host, and no such process. "I cannot tell" — another machine's pid, or a
+   platform with no liveness check — is not staleness, and neither is a lock file
+   too corrupt to parse; both need `open --force`. Linux answers liveness from
+   `/proc`; Windows would need `OpenProcess` and a dependency to spare the user one
+   `--force`, so it answers "unknown" instead.
+9. **Ctrl+C cancellation is real but narrow.** plan/08's table says a Ctrl+C during
+   a long operation cancels it. Nothing in a vault write is safely interruptible, and
+   an Argon2 run or a device touch cannot be aborted mid-flight — so the flag is
+   consulted between *candidate factors* during an unlock, which is exactly where a
+   user means "stop asking me". Anywhere else the operation finishes and the session
+   survives, which is the deferral plan/08 asks for in the same paragraph. On
+   Windows there is no SIGINT handler at all: `rustyline` covers Ctrl+C at the
+   prompt, and a Ctrl+C during an operation ends the process — safe for the vault,
+   since `Vault::write` renames a complete temp file into place, but it does end the
+   session.
+10. **Interrupting a slow shutdown is not implemented, because there is no slow
+    shutdown.** Closing a store in M9 drops a key and unlinks a lock file; the
+    sealing that makes shutdown worth interrupting arrives with M10's working
+    directories, and the check belongs with it.
+
+### New dependencies
+
+`rustyline` (named by plan/08) with default features off, and `signal-hook` on unix
+only — `SIGTERM`/`SIGHUP` handling is required by this milestone and std exposes no
+way to catch them. Both are pure Rust; `cargo audit` reports no advisories.
 
 ## M10 — Working directories for `file` and `dir` stores
 
-The part that puts plaintext on disk, and the reason it is its own milestone.
+The part that puts plaintext on disk, and the reason it is its own milestone. M9
+built the session around their absence, so the additions are: extraction at `open`,
+a dirty flag and the `stores` column that shows it, a `seal` that writes, and a
+shutdown slow enough to be worth interrupting.
 
 - Extraction on `open` to `$XDG_RUNTIME_DIR`/temp, mode `0700`, never beside the vault
   by default; `--work-dir` with a warning when the destination looks like a git repo

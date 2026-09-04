@@ -13,7 +13,7 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "fidostorers"
-path = "src/bin/fidostorers.rs"
+path = "src/bin/fidostorers/main.rs"
 
 [features]
 default = ["hardware"]
@@ -38,6 +38,14 @@ rpassword.workspace = true
 postcard.workspace = true
 tempfile.workspace = true
 tar.workspace = true
+rustyline.workspace = true
+serde_json.workspace = true
+
+# The graceful-shutdown signals plan/08 names (SIGTERM, SIGHUP) and the SIGINT that
+# cancels an operation without ending the session. No Windows equivalent exists, so
+# this is unix-only; see `repl::signals`.
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -158,6 +158,64 @@ Each `kv set`/`kv rm` re-encrypts and rewrites the whole vault. That keeps the f
 simple and is fine for hundreds of small secrets; it is not built for hundreds of
 thousands.
 
+## Sessions: unlock once, not once per command
+
+Every command above needs its own touch. That is the default and the safest thing,
+but it gets tiring when you are working through a handful of secrets in a row.
+`fidostorers interactive` unlocks a vault once and keeps its key until you close it:
+
+```sh
+fidostorers interactive
+```
+
+```
+fidostorers 0.1.0 — `help` lists commands, `exit` closes every store and quits
+Stores close automatically after 15m idle.
+
+fidostorers> open tokens.fido
+touch your security key...
+opened "tokens" (kv)
+
+fidostorers> kv get tokens github
+ghp_...
+
+fidostorers> kv set tokens gitlab --file ./token.txt
+set "gitlab"
+
+fidostorers> stores
+  tokens       kv    idle 0s     tokens.fido
+
+fidostorers> exit
+closing tokens
+```
+
+Any number of vaults can be open at once, each with an alias taken from its file
+name (`--as` renames one). `open`, `close`, `stores`, `info`, `init`, `kv *`,
+`enroll`, `revoke`, `help` and `exit` all work; `help <command>` explains any of
+them. Ctrl+D or `exit` closes everything and quits; Ctrl+C clears the line you are
+typing without ending the session.
+
+> **A session is weaker than the default, on purpose.** Each open vault's data key
+> lives in memory until you close it, so anything that can read this process's
+> memory while it runs can read that key. Stores therefore close themselves after
+> 15 minutes idle (`--idle-timeout <secs>`, or `0` to disable), and closing —
+> whether by `close`, `exit`, a timeout, or `SIGTERM` — drops the key.
+>
+> Memory pinning and core-dump suppression are **not implemented yet**, so do not
+> treat a running session as equivalent to a vault at rest.
+
+`file` and `dir` vaults can be opened, which caches the key so `info`, `enroll` and
+`revoke` cost no further touches — but their contents are not yet extracted for
+editing, so `kv` vaults are the ones that are fully usable in a session. Use
+`lock`/`unlock` for the others.
+
+While a session has a vault open it holds a `<vault>.lock` file beside it, and any
+other `fidostorers` command that would *write* to that vault refuses rather than
+racing it. Reading (`info`, `unlock`, `kv get`, `kv ls`) is never blocked. If a
+session is killed outright, the stale lock is cleared automatically the next time
+you open that vault on the same machine; `open <vault> --force` overrides it
+otherwise.
+
 ## Multiple factors
 
 Any enrolled factor opens the vault. Enroll at least two.
@@ -253,6 +311,9 @@ cargo clippy --workspace --all-targets --features fido-token/test-util -- -D war
 cargo fmt --all -- --check
 cargo audit
 ```
+
+`crates/fidostorers/tests/interactive.rs` drives a real session end to end using a
+keyfile factor, which is why it needs no security key.
 
 The second form drops the `hardware` feature and the whole platform HID stack, so the
 test suite builds and passes on a machine that cannot compile the real backend. Tests

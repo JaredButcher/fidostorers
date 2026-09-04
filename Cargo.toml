@@ -40,6 +40,14 @@ log = "0.4"
 env_logger = "0.11"
 rpassword = "7"
 
+# Line editing for `fidostorers interactive` (plan/08-interactive-mode.md).
+# `default-features = false` is load-bearing rather than a size optimisation: it
+# drops `with-file-history`, which makes `DefaultHistory` an in-memory history that
+# has no way to reach disk at all. plan/08 requires memory-only history because
+# `kv set --value <secret>` would otherwise be persisted in cleartext, and a type
+# that cannot write beats remembering not to call `save_history`.
+rustyline = { version = "18", default-features = false }
+
 # Mozilla's CTAP1/CTAP2 stack (the one Firefox ships). `crypto_rust` picks the
 # pure-Rust crypto backend so no NSS/OpenSSL system libraries are needed; the
 # default `crypto_nss` backend would drag in bindgen and an NSS install.
@@ -54,6 +62,13 @@ authenticator = { version = "0.5", default-features = false, features = ["crypto
 # `std` turns it on graph-wide via feature unification. Remove once the upstream
 # crate enables it itself. See docs/M1-MANUAL-TESTING.md.
 winapi = { version = "0.3.9", features = ["std"] }
+
+# SIGTERM/SIGHUP must run the same graceful shutdown as `exit` (plan/08, "Shutdown"),
+# and std exposes no way to catch them. Unix only: Windows has no SIGTERM, and
+# rustyline handles Ctrl+C at the prompt there on its own.
+[workspace.dependencies.signal-hook]
+version = "0.3"
+default-features = false
 
 [profile.release]
 # Key material lives in this process; strip debug info from release builds so

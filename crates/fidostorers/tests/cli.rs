@@ -46,8 +46,14 @@ fn info_reports_a_vault_and_labels_it_unauthenticated() {
     assert!(stdout.contains("UNAUTHENTICATED"), "{stdout}");
     assert!(stdout.contains("mode: file"), "{stdout}");
     assert!(stdout.contains("rp id: fidostorers.local"), "{stdout}");
-    assert!(stdout.contains("format version: 1"), "{stdout}");
-    assert!(stdout.contains("primary (abcdef)"), "{stdout}");
+    assert!(
+        stdout.contains(&format!("format version: {}", fidostorers::FORMAT_VERSION)),
+        "{stdout}"
+    );
+    // Since M8 a factor line is `<entry id>  <kind>  <label>`: an entry is named by
+    // its own id rather than by a credential id it may not have.
+    assert!(stdout.contains("fido2"), "{stdout}");
+    assert!(stdout.contains("primary"), "{stdout}");
 }
 
 #[test]
