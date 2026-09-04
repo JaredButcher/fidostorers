@@ -54,6 +54,14 @@ rustyline = { version = "18", default-features = false }
 # See plan/07-open-decisions.md #1.
 authenticator = { version = "0.5", default-features = false, features = ["crypto_rust"] }
 
+# Memory pinning and core-dump suppression for a session's long-lived data keys
+# (plan/06-roadmap.md M11). Both need platform calls std does not expose:
+# mlock/munlock, prctl(PR_SET_DUMPABLE) and setrlimit(RLIMIT_CORE) on unix,
+# VirtualLock/VirtualUnlock on Windows.
+libc = "0.2"
+
+# Not used directly by `fidostorers` for the HID stack, but M11 does use it for
+# VirtualLock/VirtualUnlock and GetSystemInfo. Kept here for the reason below too.
 # Not used directly. `authenticator`'s Windows HID backend passes a
 # `std::os::windows::io::RawHandle` (= `*mut core::ffi::c_void`) to a winapi
 # function expecting `*mut winapi::ctypes::c_void`. Those are the same type only
@@ -61,7 +69,7 @@ authenticator = { version = "0.5", default-features = false, features = ["crypto
 # the crate fails to compile for Windows on its own. Declaring winapi here with
 # `std` turns it on graph-wide via feature unification. Remove once the upstream
 # crate enables it itself. See docs/M1-MANUAL-TESTING.md.
-winapi = { version = "0.3.9", features = ["std"] }
+winapi = { version = "0.3.9", features = ["std", "memoryapi", "sysinfoapi", "minwindef", "basetsd"] }
 
 # SIGTERM/SIGHUP must run the same graceful shutdown as `exit` (plan/08, "Shutdown"),
 # and std exposes no way to catch them. Unix only: Windows has no SIGTERM, and

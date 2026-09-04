@@ -577,6 +577,7 @@ dependencies = [
  "fido-token",
  "hkdf",
  "hmac",
+ "libc",
  "postcard",
  "proptest",
  "rand 0.8.8",
@@ -589,6 +590,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror 1.0.69",
+ "winapi",
  "zeroize",
 ]
 

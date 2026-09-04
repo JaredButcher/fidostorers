@@ -573,3 +573,54 @@ exit
     assert!(stdout.contains("discarded"), "{stdout}");
     assert!(!work.exists(), "discard must remove the plaintext");
 }
+
+/// The M11 claim, checked against the kernel rather than against our own report: a
+/// running session's data key is pinned so it cannot be written to swap.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_session_pins_its_data_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (vault, keyfile) = make_keyfile_vault(dir.path(), "kv");
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir_all(&runtime).unwrap();
+
+    let mut child = spawn_session(&runtime);
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(
+            format!(
+                "open {} --keyfile {} --password-stdin\n{PASSWORD}\n",
+                vault.display(),
+                keyfile.display()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+    let status_path = format!("/proc/{}/status", child.id());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut locked_kb = 0u64;
+    while std::time::Instant::now() < deadline {
+        if let Ok(status) = std::fs::read_to_string(&status_path) {
+            locked_kb = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmLck:"))
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            if locked_kb > 0 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    stdin.write_all(b"exit\n").unwrap();
+    drop(stdin);
+    child.wait().unwrap();
+
+    assert!(
+        locked_kb > 0,
+        "the kernel reports no locked memory in a session holding a data key"
+    );
+}

@@ -748,7 +748,7 @@ fn build_enrollment(
     }
 }
 
-fn run() -> Result<i32> {
+fn run(hardening: &fidostorers::Hardening) -> Result<i32> {
     match Cli::parse().command {
         Commands::Init {
             vault,
@@ -1000,7 +1000,7 @@ fn run() -> Result<i32> {
             // No touch, so no data key, so `header_mac` cannot be checked.
             print_vault_info(&Vault::open(&vault)?, false);
         }
-        Commands::Interactive { args } => return repl::run(&args),
+        Commands::Interactive { args } => return repl::run(&args, hardening),
     }
     Ok(0)
 }
@@ -1085,7 +1085,14 @@ pub(crate) fn warn_revocation_is_not_rekeying() {
 }
 
 fn main() {
-    match run() {
+    // Before anything else, and for every command, not only sessions: a crash dump
+    // of a process that is holding a data key is the same exposure whether that key
+    // has been live for an hour or a millisecond, and this costs nothing. The
+    // result is reported by `interactive`, which is where it matters enough to say
+    // out loud. See plan/06-roadmap.md M11.
+    let hardening = fidostorers::Hardening::apply();
+
+    match run(&hardening) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
             eprintln!("error: {err:#}");

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use crate::hardening::SecretKey;
 use crate::lock::VaultLock;
 use crate::workdir::{Scan, WorkDir};
 use crate::{ExtractReport, Mode, Vault, VaultError};
@@ -62,11 +63,15 @@ pub enum SessionError {
 /// The data key is sufficient for every [`Vault`] operation and is the narrowest
 /// thing that works: it cannot derive anything for another vault, and it says
 /// nothing about the security key that produced it.
+///
+/// It is held in a [`SecretKey`] — its own `mlock`ed page — rather than an ordinary
+/// `Zeroizing`, because a session holds it for minutes or hours rather than for one
+/// command, which is long enough to be paged out to swap.
 #[derive(Debug)]
 pub struct Store {
     alias: String,
     vault: Vault,
-    data_key: Zeroizing<[u8; 32]>,
+    data_key: SecretKey,
     last_activity: Instant,
     /// `file` and `dir` stores are edited through a plaintext tree on disk; a `kv`
     /// store has no such thing and stays memory-only.
@@ -94,15 +99,21 @@ impl Store {
         self.vault.path()
     }
 
-    pub fn data_key(&self) -> &Zeroizing<[u8; 32]> {
+    pub fn data_key(&self) -> &[u8; 32] {
         &self.data_key
+    }
+
+    /// Whether this store's data key is actually pinned in memory. False means the
+    /// page could not be locked, which the session reports rather than hides.
+    pub fn key_is_locked(&self) -> bool {
+        self.data_key.is_locked()
     }
 
     /// Mutable vault and its data key together.
     ///
     /// Every mutating `Vault` method needs both at once, and taking them through
     /// two accessors would borrow `self` mutably and immutably at the same call.
-    pub fn parts_mut(&mut self) -> (&mut Vault, &Zeroizing<[u8; 32]>) {
+    pub fn parts_mut(&mut self) -> (&mut Vault, &[u8; 32]) {
         (&mut self.vault, &self.data_key)
     }
 
@@ -325,7 +336,9 @@ impl Session {
         self.stores.push(Store {
             alias,
             vault,
-            data_key,
+            // The caller's `Zeroizing` copy is dropped and wiped on return; from
+            // here the only surviving copy is the locked one.
+            data_key: SecretKey::new(&data_key),
             last_activity: self.clock.now(),
             work,
             last_scan,

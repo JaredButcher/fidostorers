@@ -8,6 +8,7 @@
 mod archive;
 mod crypto;
 mod error;
+pub mod hardening;
 pub mod keyfile;
 mod kv;
 pub mod lock;
@@ -19,6 +20,7 @@ pub mod workdir;
 pub use archive::{ExtractReport, SkippedEntry};
 pub use crypto::kek_from_secret;
 pub use error::VaultError;
+pub use hardening::{Hardening, SecretKey, Support};
 pub use keyfile::KeyfileParams;
 pub use lock::VaultLock;
 pub use session::{ClosedStore, Session, SessionError, Store};

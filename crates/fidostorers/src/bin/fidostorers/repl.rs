@@ -211,7 +211,7 @@ pub struct InteractiveArgs {
     pub idle_warning: u64,
 }
 
-pub fn run(args: &InteractiveArgs) -> Result<i32> {
+pub fn run(args: &InteractiveArgs, hardening: &fidostorers::Hardening) -> Result<i32> {
     // 0 means "no timeout": an explicit choice to leave vaults unlocked for the life
     // of the session, not an accidental zero-length one.
     let idle_timeout = (args.idle_timeout > 0).then(|| Duration::from_secs(args.idle_timeout));
@@ -239,7 +239,7 @@ pub fn run(args: &InteractiveArgs) -> Result<i32> {
     let mut editor =
         DefaultEditor::with_config(config).context("starting the interactive line editor")?;
 
-    banner(idle_timeout);
+    banner(idle_timeout, hardening);
 
     // Before anything else: a previous session may have died holding plaintext.
     if let Err(err) = recover_orphans(&mut editor, &paths) {
@@ -425,7 +425,7 @@ fn discard_tree(path: &Path) {
     };
 }
 
-fn banner(idle_timeout: Option<Duration>) {
+fn banner(idle_timeout: Option<Duration>, hardening: &fidostorers::Hardening) {
     println!(
         "fidostorers {} — `help` lists commands, `exit` closes every store and quits",
         env!("CARGO_PKG_VERSION")
@@ -440,10 +440,24 @@ fn banner(idle_timeout: Option<Duration>) {
     eprintln!();
     eprintln!(
         "NOTE: a session keeps each open vault's data key in memory until you close it.\n\
-         That is weaker than this tool's default of one touch per command. Memory\n\
-         pinning and core-dump suppression are not implemented yet, so do not treat a\n\
-         running session as equivalent to a vault at rest."
+         That is weaker than this tool's default of one touch per command."
     );
+    // Stated as measured facts, not as reassurance: "we tried to lock memory" and
+    // "memory is locked" are different claims, and only the second is worth making.
+    eprintln!(
+        "  data keys pinned in memory (never swapped): {}",
+        hardening.memory_locking
+    );
+    eprintln!(
+        "  core dumps suppressed:                      {}",
+        hardening.core_dumps
+    );
+    if !hardening.is_complete() {
+        eprintln!(
+            "  A data key could therefore reach swap or a crash dump. Treat this session\n\
+             \x20 as less protected than a vault at rest."
+        );
+    }
     eprintln!(
         "Opening a file or dir store extracts it to a PLAINTEXT working directory that\n\
          lives until you close the store; closing seals your changes back and removes\n\

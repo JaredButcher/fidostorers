@@ -470,6 +470,12 @@ impl Vault {
     /// Unwrap the data key using `credential_id`'s already-derived KEK, then verify
     /// the header.
     ///
+    /// Note that every method below takes the data key as a plain `&[u8; 32]` rather
+    /// than a particular wrapper. A one-shot command holds it in a `Zeroizing`; a
+    /// session holds it in a page-locked [`crate::hardening::SecretKey`]. Both deref
+    /// to the same bytes, and the vault has no business caring which — the same
+    /// reasoning that keeps `unlock_with` taking an already-derived KEK.
+    ///
     /// The order matters and follows plan/03: unwrap the data key, derive the MAC
     /// key, verify `header_mac`, and only then may a caller act on `mode`, a label,
     /// or the payload. Using the data key solely to check a MAC before the header is
@@ -522,7 +528,7 @@ impl Vault {
     /// backup key sitting in a safe is unaffected and need not be present.
     pub fn enroll(
         &mut self,
-        data_key: &Zeroizing<[u8; 32]>,
+        data_key: &[u8; 32],
         enrollment: &Enrollment,
     ) -> Result<(), VaultError> {
         self.verify_header(data_key)?;
@@ -572,11 +578,7 @@ impl Vault {
     /// anyone holding both the revoked key *and* a copy of this file from before
     /// the revoke can still recover that data key — and it still decrypts the
     /// current payload. See plan/04-security-and-threat-model.md.
-    pub fn revoke(
-        &mut self,
-        data_key: &Zeroizing<[u8; 32]>,
-        credential_id: &[u8],
-    ) -> Result<(), VaultError> {
+    pub fn revoke(&mut self, data_key: &[u8; 32], credential_id: &[u8]) -> Result<(), VaultError> {
         // Verify before acting on any header content, per plan/03's ordering.
         self.verify_header(data_key)?;
 
@@ -597,7 +599,7 @@ impl Vault {
 
     /// Rewrite the header, carrying the existing payload ciphertext across
     /// untouched. Used by `enroll`/`revoke`, which change no payload bytes.
-    fn rewrite_header(&mut self, data_key: &Zeroizing<[u8; 32]>) -> Result<(), VaultError> {
+    fn rewrite_header(&mut self, data_key: &[u8; 32]) -> Result<(), VaultError> {
         let source = PayloadSource::Existing {
             offset: self.payload_offset(),
             len: self.body.payload_len + TAG_LEN as u64,
@@ -610,22 +612,14 @@ impl Vault {
     /// Takes `&mut self` because sealing draws a fresh `payload_nonce` and changes
     /// `payload_len` — both header fields — so the in-memory header would otherwise
     /// go stale against the file just written.
-    pub fn seal_file(
-        &mut self,
-        data_key: &Zeroizing<[u8; 32]>,
-        input: &Path,
-    ) -> Result<(), VaultError> {
+    pub fn seal_file(&mut self, data_key: &[u8; 32], input: &Path) -> Result<(), VaultError> {
         self.expect_mode(Mode::File)?;
         let plaintext = Zeroizing::new(std::fs::read(input)?);
         self.seal_payload(data_key, &plaintext)
     }
 
     /// (mode = File) Decrypt this vault's payload to `output`.
-    pub fn open_file(
-        &self,
-        data_key: &Zeroizing<[u8; 32]>,
-        output: &Path,
-    ) -> Result<(), VaultError> {
+    pub fn open_file(&self, data_key: &[u8; 32], output: &Path) -> Result<(), VaultError> {
         self.expect_mode(Mode::File)?;
         let plaintext = self.open_payload(data_key)?;
         std::fs::write(output, &plaintext[..])?;
@@ -635,11 +629,7 @@ impl Vault {
     /// Encrypt `plaintext` as the whole payload and rewrite the vault atomically.
     /// Shared by every mode: file bytes today, a tar stream in M3, a serialized map
     /// in M4.
-    fn seal_payload(
-        &mut self,
-        data_key: &Zeroizing<[u8; 32]>,
-        plaintext: &[u8],
-    ) -> Result<(), VaultError> {
+    fn seal_payload(&mut self, data_key: &[u8; 32], plaintext: &[u8]) -> Result<(), VaultError> {
         self.verify_header(data_key)?;
         let payload_nonce = crypto::random_nonce();
         let payload = crypto::seal(data_key, &payload_nonce, plaintext)?;
@@ -659,10 +649,7 @@ impl Vault {
     }
 
     /// Verify the header, then decrypt and return the whole payload.
-    fn open_payload(
-        &self,
-        data_key: &Zeroizing<[u8; 32]>,
-    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    fn open_payload(&self, data_key: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         self.verify_header(data_key)?;
 
         let payload_len = usize::try_from(self.body.payload_len).map_err(|_| {
@@ -740,11 +727,7 @@ impl Vault {
     /// (mode = Dir) Archive `input_dir` into a tar stream and encrypt it into this
     /// vault. Symlinks are stored as symlinks, never followed; Unix mode bits are
     /// preserved (plan/07 #8).
-    pub fn seal_dir(
-        &mut self,
-        data_key: &Zeroizing<[u8; 32]>,
-        input_dir: &Path,
-    ) -> Result<(), VaultError> {
+    pub fn seal_dir(&mut self, data_key: &[u8; 32], input_dir: &Path) -> Result<(), VaultError> {
         self.expect_mode(Mode::Dir)?;
         let tar = Zeroizing::new(archive::build(input_dir)?);
         self.seal_payload(data_key, &tar)
@@ -757,7 +740,7 @@ impl Vault {
     /// a second full read of the same bytes for no benefit.
     pub(crate) fn seal_file_bytes(
         &mut self,
-        data_key: &Zeroizing<[u8; 32]>,
+        data_key: &[u8; 32],
         plaintext: &[u8],
     ) -> Result<(), VaultError> {
         self.expect_mode(Mode::File)?;
@@ -771,7 +754,7 @@ impl Vault {
     /// session has already built it to decide whether the seal was needed at all.
     pub(crate) fn seal_dir_archive(
         &mut self,
-        data_key: &Zeroizing<[u8; 32]>,
+        data_key: &[u8; 32],
         tar: &[u8],
     ) -> Result<(), VaultError> {
         self.expect_mode(Mode::Dir)?;
@@ -781,7 +764,7 @@ impl Vault {
     /// (mode = File) Decrypt this vault's payload to a byte buffer.
     pub(crate) fn read_file_payload(
         &self,
-        data_key: &Zeroizing<[u8; 32]>,
+        data_key: &[u8; 32],
     ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         self.expect_mode(Mode::File)?;
         self.open_payload(data_key)
@@ -790,7 +773,7 @@ impl Vault {
     /// (mode = Dir) Decrypt this vault's payload to its tar stream.
     pub(crate) fn read_dir_archive(
         &self,
-        data_key: &Zeroizing<[u8; 32]>,
+        data_key: &[u8; 32],
     ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         self.expect_mode(Mode::Dir)?;
         self.open_payload(data_key)
@@ -804,7 +787,7 @@ impl Vault {
     /// from a complete one. Check [`ExtractReport::is_complete`].
     pub fn open_dir(
         &self,
-        data_key: &Zeroizing<[u8; 32]>,
+        data_key: &[u8; 32],
         output_dir: &Path,
     ) -> Result<ExtractReport, VaultError> {
         self.expect_mode(Mode::Dir)?;
@@ -819,7 +802,7 @@ impl Vault {
     /// plan/02-crate-fidostorers.md.
     pub fn kv_set(
         &mut self,
-        data_key: &Zeroizing<[u8; 32]>,
+        data_key: &[u8; 32],
         name: &str,
         value: &[u8],
     ) -> Result<(), VaultError> {
@@ -832,7 +815,7 @@ impl Vault {
     /// (mode = Kv) Get one entry's value.
     pub fn kv_get(
         &self,
-        data_key: &Zeroizing<[u8; 32]>,
+        data_key: &[u8; 32],
         name: &str,
     ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         let store = self.load_kv(data_key)?;
@@ -844,7 +827,7 @@ impl Vault {
 
     /// (mode = Kv) Remove one entry. Errors if it was not there, so a typo'd name
     /// cannot look like a successful deletion.
-    pub fn kv_rm(&mut self, data_key: &Zeroizing<[u8; 32]>, name: &str) -> Result<(), VaultError> {
+    pub fn kv_rm(&mut self, data_key: &[u8; 32], name: &str) -> Result<(), VaultError> {
         let mut store = self.load_kv(data_key)?;
         if !store.remove(name) {
             return Err(VaultError::NoSuchEntry(name.to_string()));
@@ -854,12 +837,12 @@ impl Vault {
     }
 
     /// (mode = Kv) List entry names, sorted.
-    pub fn kv_ls(&self, data_key: &Zeroizing<[u8; 32]>) -> Result<Vec<String>, VaultError> {
+    pub fn kv_ls(&self, data_key: &[u8; 32]) -> Result<Vec<String>, VaultError> {
         Ok(self.load_kv(data_key)?.names())
     }
 
     /// Verify the header, decrypt the payload, and parse it as a kv store.
-    fn load_kv(&self, data_key: &Zeroizing<[u8; 32]>) -> Result<KvMap, VaultError> {
+    fn load_kv(&self, data_key: &[u8; 32]) -> Result<KvMap, VaultError> {
         self.expect_mode(Mode::Kv)?;
         let plaintext = self.open_payload(data_key)?;
         KvMap::decode(&plaintext)
@@ -875,10 +858,7 @@ fn empty_payload(mode: Mode) -> Result<Vec<u8>, VaultError> {
     }
 }
 
-fn wrap_for(
-    enrollment: &Enrollment,
-    data_key: &Zeroizing<[u8; 32]>,
-) -> Result<FactorEntry, VaultError> {
+fn wrap_for(enrollment: &Enrollment, data_key: &[u8; 32]) -> Result<FactorEntry, VaultError> {
     let wrap_nonce = crypto::random_nonce();
     let wrapped_data_key = crypto::seal(&enrollment.kek, &wrap_nonce, &data_key[..])?;
     let mut id = [0u8; 16];

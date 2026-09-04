@@ -207,6 +207,9 @@ mod tests {
         }
     }
 
+    /// Linux-only, like its callers: the tests that use it turn on dead-pid
+    /// detection, which only Linux can answer (see `lock::process_is_alive`).
+    #[cfg(target_os = "linux")]
     fn write_foreign_record(root: &Path, pid: u32, stores: Vec<StoreRecord>) -> PathBuf {
         let dir = records_dir(root);
         std::fs::create_dir_all(&dir).unwrap();

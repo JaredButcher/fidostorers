@@ -43,9 +43,15 @@ serde_json.workspace = true
 
 # The graceful-shutdown signals plan/08 names (SIGTERM, SIGHUP) and the SIGINT that
 # cancels an operation without ending the session. No Windows equivalent exists, so
-# this is unix-only; see `repl::signals`.
+# this is unix-only; see `repl::signals`. `libc` is the M11 hardening: mlock,
+# prctl(PR_SET_DUMPABLE) and setrlimit(RLIMIT_CORE).
 [target.'cfg(unix)'.dependencies]
 signal-hook.workspace = true
+libc.workspace = true
+
+# VirtualLock/VirtualUnlock and GetSystemInfo, for the same hardening.
+[target.'cfg(windows)'.dependencies]
+winapi.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -183,7 +183,7 @@ fidostorers> kv set tokens gitlab --file ./token.txt
 set "gitlab"
 
 fidostorers> stores
-  tokens       kv    idle 0s     tokens.fido
+  tokens       kv    -        idle 0s    tokens.fido
 
 fidostorers> exit
 closing tokens
@@ -194,6 +194,26 @@ name (`--as` renames one). `open`, `close`, `stores`, `seal`, `info`, `init`,
 `kv *`, `enroll`, `revoke`, `help` and `exit` all work; `help <command>` explains
 any of them. Ctrl+D or `exit` closes everything and quits; Ctrl+C clears the line
 you are typing without ending the session.
+
+> **A session is weaker than the default, on purpose.** Each open vault's data key
+> lives in memory until you close it. Stores therefore close themselves after 15
+> minutes idle (`--idle-timeout <secs>`, or `0` to disable), and closing — whether
+> by `close`, `exit`, a timeout, or `SIGTERM` — drops the key.
+>
+> To match that longer lifetime, a session pins each data key in its own locked page
+> so it cannot be written to swap, and the process suppresses its own core dumps —
+> which on Linux also stops another program running as you from reading its memory
+> or attaching a debugger. The startup banner reports whether each is *actually* in
+> force:
+>
+> ```
+>   data keys pinned in memory (never swapped): enabled
+>   core dumps suppressed:                      enabled
+> ```
+>
+> If either line says otherwise, believe it rather than this page. On Windows, crash
+> dumps are configured by the system and a process cannot refuse them, so that line
+> will say so; memory pinning does work there.
 
 ### Editing files and directories
 

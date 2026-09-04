@@ -60,11 +60,19 @@ large file, so this is not the interesting attack.
 ## In-process secret hygiene
 
 - All key material (`secret_i`, `KEK_i`, data key, decrypted KV values) is held in
-  `Zeroizing<...>` wrappers (from the `zeroize` crate) so it's wiped on drop. This is
-  best-effort defense in depth in a memory-safe language without mlock — it does not
-  protect against swap-to-disk or a coredump taken mid-operation. `mlock`/`VirtualLock`
-  pinning is a possible v2 hardening item, not required for v1 (tracked in
-  [06-roadmap.md](06-roadmap.md)).
+  `Zeroizing<...>` wrappers (from the `zeroize` crate) so it's wiped on drop.
+- **Core dumps are suppressed for every command** (M11): `RLIMIT_CORE = 0` plus
+  `PR_SET_DUMPABLE = 0` on Linux. The second also makes `/proc/<pid>/mem` root-owned,
+  so another process running as the same user cannot read this one's memory or
+  attach with `ptrace`. Windows crash dumps are configured by the system and cannot
+  be refused by the process; the CLI says so rather than implying otherwise.
+- **A session's data keys are pinned in memory** (M11), each in its own
+  `mlock`ed (`VirtualLock`ed) page, so the 32 bytes that open a vault cannot be
+  written to swap during the minutes or hours a session holds them. Whether the lock
+  actually succeeded is measured and printed, not assumed.
+- Not pinned, deliberately: keys held for the duration of a single one-shot command
+  (short-lived enough to be unlikely to page out), and decrypted payloads (a `dir`
+  tree can exceed any `RLIMIT_MEMLOCK`, and M10 puts it on disk by design anyway).
 - PINs (if the authenticator requires one) are read via a no-echo prompt
   (`rpassword` crate) and never written to disk, logs, or shell history. They are
   passed straight to `fido-token`'s register/derive calls and dropped immediately
@@ -201,11 +209,12 @@ and reported rather than deleted, and offered back by the next session. That is 
 right trade — losing data is worse than leaving a file on disk — but it does mean an
 interrupted or failing session can leave plaintext where a clean one would not.
 
-**A session is not yet hardened for the key lifetime it introduces.** `mlock`/
-`VirtualLock` pinning and core-dump suppression are M11 and are not implemented, so
-a session's data keys can be swapped to disk or captured in a crash dump. The CLI
-says so at startup rather than leaving it here, and interactive mode should not be
-described as safe until those land.
+**A session is hardened for the key lifetime it introduces** (M11). Each open
+store's data key sits in its own `mlock`ed page, so it cannot reach swap, and the
+process suppresses its own core dumps — which on Linux also blocks a same-user
+process from reading its memory. Both are probed at startup and their real status is
+printed, so a session never claims a protection it did not get. The remaining gap is
+Windows crash dumps, which a process cannot refuse.
 
 **What does not change:** a vault at rest, with no session running, is exactly as
 protected as before. Tamper detection is untouched — a session verifies `header_mac`

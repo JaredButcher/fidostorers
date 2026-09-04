@@ -244,18 +244,22 @@ than spraying control bytes at the terminal.
 
 ## Secret hygiene consequences
 
-Long-lived keys make two deferred items materially more important:
+Long-lived keys made two deferred items load-bearing. Both landed as **M11**, and a
+session now measures and prints whether each is actually in force rather than
+assuming it:
 
-- **`mlock`/`VirtualLock` memory pinning**, currently phase 2 in
-  [06-roadmap.md](06-roadmap.md). A data key held for a single command is unlikely to
-  be swapped out; one held for an hour is a different proposition. This should be
-  promoted to ship alongside interactive mode.
-- **Core dump suppression** (`prctl(PR_SET_DUMPABLE, 0)` on Linux, equivalent on
-  Windows). A crash dump of a session process contains every open store's data key.
+- **`mlock`/`VirtualLock` memory pinning.** Each open store's data key lives in its
+  own page-aligned, pinned allocation, so it cannot be written to swap. A page per
+  key, because `mlock` works on whole pages — and because pinning the address of an
+  ordinary `Zeroizing` value would pin a page that value is free to be moved out of.
+- **Core dump suppression.** `RLIMIT_CORE = 0` and `PR_SET_DUMPABLE = 0` on Linux,
+  applied to every command rather than only sessions. The second is the more
+  valuable: it also makes `/proc/<pid>/mem` root-owned, so a same-user process can no
+  longer read a running session's memory or attach with `ptrace`.
 
-Neither is required for a first working version, but both should land before
-interactive mode is recommended for real use, and the docs must not describe the
-session as safe until they do.
+Windows crash dumps are configured by the system and cannot be refused by the
+process, so that one is reported as unavailable rather than quietly skipped;
+`VirtualLock` does work there. Full accounting in [06-roadmap.md](06-roadmap.md) M11.
 
 ## Testing
 

@@ -454,15 +454,77 @@ The part that puts plaintext on disk, and the reason it is its own milestone.
 
 ## M11 — Hardening to match the longer key lifetime
 
-Promoted out of phase 2 by M9/M10: a data key held for a single command is unlikely to
-be swapped out, but one held for an hour is a different proposition.
+**Code: done. Windows validation: outstanding (cross-compiles and passes clippy, but
+the platform calls are untested on real Windows).**
 
-- `mlock`/`VirtualLock` pinning for data keys.
-- Core-dump suppression, so a crash dump of a session process cannot contain every
-  open store's data key.
+Promoted out of phase 2 by M9/M10: a data key held for a single command is unlikely
+to be swapped out, but one held for an hour is a different proposition.
+
+- [x] `mlock`/`VirtualLock` pinning for data keys. Each session-held data key gets
+  its own page-aligned, page-sized allocation, pinned before the secret is written
+  into it and zeroized before the page is released.
+- [x] Core-dump suppression, so a crash dump of a session process cannot contain
+  every open store's data key. `RLIMIT_CORE = 0` plus `PR_SET_DUMPABLE = 0` on
+  Linux; applied to every command, not only sessions.
+- [x] The status is **measured and printed**, not assumed: `interactive` shows
+  whether each measure is actually in force, and says plainly when one is not.
+- [ ] Manual check on Windows that `VirtualLock` succeeds and the status line says
+  so.
 
 Interactive mode should not be recommended for real use, and the docs should not
-describe a session as safe, until these land.
+describe a session as safe, until these land. **They have landed on Linux**, with
+the Windows caveat below.
+
+### Refinements made while implementing
+
+1. **A page per key, not an `mlock` of wherever the key happened to be.** `mlock`
+   and `munlock` operate on whole pages, so two secrets sharing a page would mean
+   unlocking one silently unlocked the other. More fundamentally, locking the
+   address of an ordinary `Zeroizing<[u8; 32]>` would pin a page the value is free
+   to be moved out of — Rust moves values by `memcpy`, and the lock does not follow.
+   `SecretKey` therefore owns a stable, page-aligned allocation that the bytes never
+   leave. 4 KiB per open store.
+2. **`Vault` now takes `&[u8; 32]` rather than `&Zeroizing<[u8; 32]>`.** A one-shot
+   command holds its data key in a `Zeroizing`; a session holds it in a locked
+   `SecretKey`. The vault has no business caring which, and deref coercion meant
+   every existing call site kept compiling unchanged. Same reasoning as
+   `unlock_with` taking an already-derived KEK.
+3. **`PR_SET_DUMPABLE(0)` buys more than dump suppression, and it was worth
+   checking.** It also makes the per-process files under `/proc/<pid>` root-owned,
+   so another process running as the same user can no longer read `/proc/<pid>/mem`
+   or attach with `ptrace` — verified: the file becomes `root:root` and reading it
+   fails with `EACCES`. That closes the most direct route to a running session's
+   keys.
+4. **...and it interacts with staleness detection, which had to be checked.** Vault
+   locks and orphan records both decide "is that process still alive?" by looking
+   for `/proc/<pid>`. If hardening had hidden that directory, every *live* session
+   would have looked dead to the next one — auto-clearing live locks and offering
+   live working directories up for recovery, both of which lose data. The directory
+   stays user-owned and visible; there is a regression test asserting exactly that.
+5. **Hardening applies to every command, not only sessions.** A crash dump holding a
+   data key is the same exposure whether the key has been live for an hour or a
+   millisecond, and the call is free. Memory *pinning* stays session-scoped, which is
+   where the plan located the risk.
+6. **Status is reported, never assumed.** `mlock` can fail on `RLIMIT_MEMLOCK`, and
+   Windows cannot suppress dumps at all. Both are probed and printed, because "we
+   tried to lock memory" and "memory is locked" are different claims and only the
+   second is worth making to a user deciding whether to trust a session.
+
+### What is *not* hardened, deliberately
+
+- **Windows core dumps.** Crash dumps there are configured by the system (WER, or a
+  registered post-mortem debugger) and a process cannot opt out.
+  `WerRegisterExcludedMemoryBlock` could exclude specific pages, but it does not
+  exist before Windows 10 1709 and would need dynamic resolution; shipping untested
+  FFI for it would be worse than reporting the gap, which is what the status line
+  does. `VirtualLock` *is* implemented, so memory pinning works there.
+- **Decrypted payloads.** A `dir` store's working tree can be gigabytes, far beyond
+  any `RLIMIT_MEMLOCK`, and it is on disk by design (M10) rather than only in memory.
+  M11 protects the 32 bytes that open a vault, which is the exposure a long-lived
+  session adds; the plaintext exposure is M10's, and its answer is a tmpfs.
+- **One-shot command keys.** Not pinned. A key that exists for the duration of one
+  command is unlikely to be paged out, which is the reasoning that put this
+  milestone after M9 in the first place.
 
 ## Phase 2 (explicitly deferred, not committed)
 - **Direct `webauthn.dll` backend for Windows**, to remove the Administrator
@@ -479,8 +541,7 @@ describe a session as safe, until these land.
   lower-assurance and needs its own scrutiny before shipping).
 - Resident/discoverable credential support.
 - NFC/BLE transports.
-- `mlock`/`VirtualLock` memory pinning hardening. **Promoted to M11** if interactive
-  mode is built, since that is what makes it load-bearing rather than nice to have.
+- ~~`mlock`/`VirtualLock` memory pinning hardening.~~ **Done in M11.**
 - A true `--rekey` for `revoke` (new data key, payload re-encrypted, every surviving
   credential re-wrapped), which needs every remaining key physically present. See M5's
   finding above.
