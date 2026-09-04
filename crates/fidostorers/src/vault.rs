@@ -750,6 +750,52 @@ impl Vault {
         self.seal_payload(data_key, &tar)
     }
 
+    /// (mode = File) Seal bytes that are already in hand.
+    ///
+    /// A session has just read the working file to decide whether anything changed
+    /// ([`crate::workdir`]), so re-reading it through [`Vault::seal_file`] would be
+    /// a second full read of the same bytes for no benefit.
+    pub(crate) fn seal_file_bytes(
+        &mut self,
+        data_key: &Zeroizing<[u8; 32]>,
+        plaintext: &[u8],
+    ) -> Result<(), VaultError> {
+        self.expect_mode(Mode::File)?;
+        self.seal_payload(data_key, plaintext)
+    }
+
+    /// (mode = Dir) Seal a tar stream that is already built.
+    ///
+    /// Same reason as [`Vault::seal_file_bytes`], and it matters more here: for a
+    /// large tree, building the archive is the expensive half of a seal, and a
+    /// session has already built it to decide whether the seal was needed at all.
+    pub(crate) fn seal_dir_archive(
+        &mut self,
+        data_key: &Zeroizing<[u8; 32]>,
+        tar: &[u8],
+    ) -> Result<(), VaultError> {
+        self.expect_mode(Mode::Dir)?;
+        self.seal_payload(data_key, tar)
+    }
+
+    /// (mode = File) Decrypt this vault's payload to a byte buffer.
+    pub(crate) fn read_file_payload(
+        &self,
+        data_key: &Zeroizing<[u8; 32]>,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        self.expect_mode(Mode::File)?;
+        self.open_payload(data_key)
+    }
+
+    /// (mode = Dir) Decrypt this vault's payload to its tar stream.
+    pub(crate) fn read_dir_archive(
+        &self,
+        data_key: &Zeroizing<[u8; 32]>,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        self.expect_mode(Mode::Dir)?;
+        self.open_payload(data_key)
+    }
+
     /// (mode = Dir) Decrypt and extract this vault's payload into `output_dir`.
     ///
     /// Extraction is best-effort per platform, so this returns an

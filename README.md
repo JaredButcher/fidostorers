@@ -190,31 +190,81 @@ closing tokens
 ```
 
 Any number of vaults can be open at once, each with an alias taken from its file
-name (`--as` renames one). `open`, `close`, `stores`, `info`, `init`, `kv *`,
-`enroll`, `revoke`, `help` and `exit` all work; `help <command>` explains any of
-them. Ctrl+D or `exit` closes everything and quits; Ctrl+C clears the line you are
-typing without ending the session.
+name (`--as` renames one). `open`, `close`, `stores`, `seal`, `info`, `init`,
+`kv *`, `enroll`, `revoke`, `help` and `exit` all work; `help <command>` explains
+any of them. Ctrl+D or `exit` closes everything and quits; Ctrl+C clears the line
+you are typing without ending the session.
 
-> **A session is weaker than the default, on purpose.** Each open vault's data key
-> lives in memory until you close it, so anything that can read this process's
-> memory while it runs can read that key. Stores therefore close themselves after
-> 15 minutes idle (`--idle-timeout <secs>`, or `0` to disable), and closing —
-> whether by `close`, `exit`, a timeout, or `SIGTERM` — drops the key.
+### Editing files and directories
+
+Opening a `file` or `dir` vault extracts it to a **working directory**, so you can
+use an editor, a file manager, `grep` — anything. Closing seals your changes back
+and removes it:
+
+```
+fidostorers> open backup.fido
+opened "backup" (dir) at /run/user/1000/fidostorers/work-4213-9f3a/backup
+
+  ...edit files there with whatever tools you like...
+
+fidostorers> stores
+  backup       dir   changed  idle 0s    backup.fido
+       work: /run/user/1000/fidostorers/work-4213-9f3a/backup
+
+fidostorers> exit
+sealed "backup"
+```
+
+`seal <alias|all>` writes without closing, if you want a checkpoint. A store nobody
+changed is not rewritten at all, so the vault file stays byte-identical.
+
+> **This is plaintext on disk, for as long as the store is open.** It goes in
+> `$XDG_RUNTIME_DIR` (usually a tmpfs, so it lives in RAM and is cleared at logout),
+> mode `0700`, and **never beside the vault** — a vault often sits in a synced
+> folder or a git repo, and extracting next to it would push your decrypted files
+> straight into cloud sync or version history. `--work-dir <path>` overrides it, and
+> warns if the destination looks like a repo or a sync folder.
 >
-> Memory pinning and core-dump suppression are **not implemented yet**, so do not
-> treat a running session as equivalent to a vault at rest.
+> **Deleting a working directory is `unlink`, not secure erasure, and making it so
+> is not something this tool tries to do.** On an SSD or a copy-on-write filesystem,
+> overwriting a file does not reliably destroy what was there. If plaintext must
+> never reach stable storage, keep the working directory on a tmpfs or a ramdisk —
+> which is what the default already is on Linux — or use a `kv` vault, which never
+> needs one.
+>
+> On Windows there is no `0700`; the directory inherits your user profile's
+> permissions and is only as private as that profile.
 
-`file` and `dir` vaults can be opened, which caches the key so `info`, `enroll` and
-`revoke` cost no further touches — but their contents are not yet extracted for
-editing, so `kv` vaults are the ones that are fully usable in a session. Use
-`lock`/`unlock` for the others.
+If a seal fails, the working directory is **kept** rather than deleted — it is the
+only copy of your changes at that point — and the session says where it is.
 
-While a session has a vault open it holds a `<vault>.lock` file beside it, and any
-other `fidostorers` command that would *write* to that vault refuses rather than
-racing it. Reading (`info`, `unlock`, `kv get`, `kv ls`) is never blocked. If a
-session is killed outright, the stale lock is cleared automatically the next time
-you open that vault on the same machine; `open <vault> --force` overrides it
-otherwise.
+### If a session is killed
+
+A session that is killed outright (or loses power) leaves its working directory
+behind, unsealed. The next session finds it and offers it back:
+
+```
+Found an unsealed working directory from a session that did not exit cleanly:
+  vault:   /home/u/backup.fido
+  work:    /run/user/1000/fidostorers/work-4213-9f3a/backup
+  holds:   12 entries, last modified since that session started
+  [s]eal it into the vault  [d]iscard it  [l]eave it for now:
+```
+
+Sealing costs an unlock, since the data key died with the old process. "Leave it"
+writes nothing, and you will be asked again next time.
+
+### One vault, one process
+
+While a session has a vault open it holds a `<vault>.lock` beside it, and **no other
+`fidostorers` command may open or write that vault** — including to read it, since
+the session's working directory can hold changes the vault file does not have yet.
+Close the store, or exit the session, and everything works again.
+
+If a session is killed, the stale lock is cleared automatically the next time you
+open that vault on the same machine. On Windows, or for a lock recorded by another
+machine, liveness cannot be checked, so use `open <vault> --force` — which tells you
+whose lock you are taking.
 
 ## Multiple factors
 

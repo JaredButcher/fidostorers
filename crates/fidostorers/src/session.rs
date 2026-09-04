@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 use crate::lock::VaultLock;
-use crate::{Vault, VaultError};
+use crate::workdir::{Scan, WorkDir};
+use crate::{ExtractReport, Mode, Vault, VaultError};
 
 /// The default idle timeout (plan/07 #18). On by default so that a session does not
 /// quietly become an always-unlocked vault on an unattended machine.
@@ -67,8 +68,15 @@ pub struct Store {
     vault: Vault,
     data_key: Zeroizing<[u8; 32]>,
     last_activity: Instant,
-    /// Held for as long as the store is open, so a second session — and any
-    /// one-shot command that writes — refuses rather than racing us.
+    /// `file` and `dir` stores are edited through a plaintext tree on disk; a `kv`
+    /// store has no such thing and stays memory-only.
+    work: Option<WorkDir>,
+    /// The last stat-only summary of `work`, so the idle watchdog can tell that a
+    /// user editing files in another window is working rather than idle, without
+    /// re-reading the tree on every tick.
+    last_scan: Scan,
+    /// Held for as long as the store is open, so a second session — and any other
+    /// `fidostorers` command touching this vault — refuses rather than racing us.
     /// Dropped, and so released, when this `Store` is.
     _lock: VaultLock,
 }
@@ -101,6 +109,115 @@ impl Store {
     pub fn idle_for(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.last_activity)
     }
+
+    pub fn mode(&self) -> Mode {
+        self.vault.mode()
+    }
+
+    /// Leave this store's plaintext on disk when it is dropped, so it can be
+    /// recovered later. For a seal that failed or was not attempted.
+    pub fn keep_plaintext(&mut self) {
+        if let Some(work) = &mut self.work {
+            work.keep();
+        }
+    }
+
+    /// Where this store's plaintext is, for `file` and `dir` stores.
+    pub fn work_path(&self) -> Option<&Path> {
+        self.work.as_ref().map(|work| work.path())
+    }
+
+    /// Whether a seal would write anything.
+    ///
+    /// Reads the working tree, because this is the answer that decides a write: a
+    /// cheap guess that said "unchanged" would silently discard the user's edits.
+    /// A `kv` store is never pending — its writes go straight to the vault as they
+    /// are made.
+    pub fn is_pending(&self) -> Result<bool, VaultError> {
+        match &self.work {
+            Some(work) => Ok(work.pending()?.is_some()),
+            None => Ok(false),
+        }
+    }
+
+    /// Cheap "has anything been touched?", for status display and idle activity.
+    /// May report a change that turns out not to alter the sealed bytes; never used
+    /// to decide whether to write.
+    pub fn looks_touched(&self) -> bool {
+        self.work
+            .as_ref()
+            .is_some_and(|work| work.scan() != self.last_scan)
+    }
+
+    /// Write the working tree into the vault if it has changed, and report whether
+    /// anything was written.
+    ///
+    /// Building the archive is the expensive half of sealing a large tree, and the
+    /// check has already built it — so the bytes are sealed directly rather than
+    /// walking the tree a second time.
+    pub fn seal(&mut self) -> Result<bool, VaultError> {
+        let Some(work) = &mut self.work else {
+            return Ok(false);
+        };
+        let Some(pending) = work.pending()? else {
+            return Ok(false);
+        };
+
+        match self.vault.mode() {
+            Mode::File => self
+                .vault
+                .seal_file_bytes(&self.data_key, &pending.payload)?,
+            Mode::Dir => self
+                .vault
+                .seal_dir_archive(&self.data_key, &pending.payload)?,
+            Mode::Kv => return Ok(false),
+        }
+        // Only after the write succeeded: a failed seal must leave the store
+        // pending, so exiting again still tries.
+        work.mark_sealed(pending.digest);
+        self.last_scan = work.scan();
+        Ok(true)
+    }
+}
+
+/// A store that has been taken out of the session, with what happened when it was
+/// sealed on the way out.
+///
+/// The seal result travels with the store because the two are decided together and
+/// reported together: "closed, wrote 3 changed files" and "closed, but the write
+/// failed" are the messages a user needs, and neither can be reconstructed from the
+/// store alone.
+#[derive(Debug)]
+pub struct ClosedStore {
+    pub store: Store,
+    /// `Ok(true)` if the vault was written, `Ok(false)` if nothing had changed.
+    pub sealed: Result<bool, VaultError>,
+}
+
+impl ClosedStore {
+    /// Seal a store on its way out of the session.
+    ///
+    /// Failure is carried rather than raised: the store is already out of the
+    /// session, and the caller has to be able to finish closing the others and
+    /// still report this one.
+    pub fn seal(store: Store) -> Self {
+        seal_and_take(store)
+    }
+
+    pub fn alias(&self) -> &str {
+        self.store.alias()
+    }
+}
+
+fn seal_and_take(mut store: Store) -> ClosedStore {
+    let sealed = store.seal();
+    if sealed.is_err() {
+        // The working tree is now the only copy of the user's changes. Removing it
+        // would turn a failed write into data loss, so it is kept and becomes an
+        // orphan the next session offers to recover.
+        store.keep_plaintext();
+    }
+    ClosedStore { store, sealed }
 }
 
 /// One process, any number of open stores.
@@ -151,6 +268,24 @@ impl Session {
         lock: VaultLock,
         requested_alias: Option<String>,
     ) -> Result<&Store, SessionError> {
+        self.open_with_work_dir(vault, data_key, lock, requested_alias, None)
+            .map(|(store, _)| store)
+    }
+
+    /// Open a store, extracting `file`/`dir` contents into `work_path`.
+    ///
+    /// `work_path` is required for those modes and rejected for `kv`, which has
+    /// nothing to extract. The extraction report comes back alongside the store
+    /// because a `dir` payload can hold entries this platform cannot create, and
+    /// the caller has to be able to say which.
+    pub fn open_with_work_dir(
+        &mut self,
+        vault: Vault,
+        data_key: Zeroizing<[u8; 32]>,
+        lock: VaultLock,
+        requested_alias: Option<String>,
+        work_path: Option<&Path>,
+    ) -> Result<(&Store, ExtractReport), SessionError> {
         // The lock would already have caught another *process*, but not this one:
         // we hold our own lock, so a second `open` of the same file would report
         // the session as busy with itself. Saying "already open, as `tokens`" is
@@ -166,14 +301,37 @@ impl Session {
             Some(alias) => self.unique_alias(&alias),
             None => self.unique_alias(&default_alias(vault.path())),
         };
+
+        let (work, report) = match (vault.mode(), work_path) {
+            (Mode::Kv, _) => (None, ExtractReport::default()),
+            (mode, Some(path)) => {
+                // Decrypt and extract before the store exists, so a failure here
+                // leaves nothing half-open and releases the lock on the way out.
+                let payload = match mode {
+                    Mode::File => vault.read_file_payload(&data_key)?,
+                    _ => vault.read_dir_archive(&data_key)?,
+                };
+                let (work, report) = WorkDir::extract_into(path, mode, &payload)?;
+                (Some(work), report)
+            }
+            (mode, None) => {
+                return Err(SessionError::Vault(VaultError::Internal(format!(
+                    "a {mode} store needs a working directory"
+                ))))
+            }
+        };
+
+        let last_scan = work.as_ref().map(|work| work.scan()).unwrap_or_default();
         self.stores.push(Store {
             alias,
             vault,
             data_key,
             last_activity: self.clock.now(),
+            work,
+            last_scan,
             _lock: lock,
         });
-        Ok(self.stores.last().expect("just pushed"))
+        Ok((self.stores.last().expect("just pushed"), report))
     }
 
     /// Resolve a name the user typed: an alias, or the path the store was opened
@@ -200,25 +358,98 @@ impl Session {
         Ok(&mut self.stores[index])
     }
 
-    /// Close one store, returning it so the caller can report on it. Dropping the
-    /// returned value zeroizes the data key and releases the lock.
-    pub fn close(&mut self, name: &str) -> Result<Store, SessionError> {
+    /// Close one store, sealing it first. Dropping the returned value zeroizes the
+    /// data key, removes the working directory, and releases the lock.
+    pub fn close(&mut self, name: &str) -> Result<ClosedStore, SessionError> {
         let index = self.resolve(name)?;
-        Ok(self.stores.remove(index))
+        Ok(seal_and_take(self.stores.remove(index)))
     }
 
     /// Close every store, in the order they were opened.
-    pub fn close_all(&mut self) -> Vec<Store> {
+    ///
+    /// One store failing to seal does not stop the others: the rest still get
+    /// written and their plaintext still gets removed, and the caller reports the
+    /// failure and exits non-zero.
+    pub fn close_all(&mut self) -> Vec<ClosedStore> {
+        self.take_all().into_iter().map(seal_and_take).collect()
+    }
+
+    /// Remove every store from the session *without* sealing.
+    ///
+    /// For a shutdown that seals them one at a time and has to stay interruptible
+    /// between stores: the caller seals each in turn and can stop partway, keeping
+    /// the plaintext of whatever it did not get to.
+    pub fn take_all(&mut self) -> Vec<Store> {
         std::mem::take(&mut self.stores)
     }
 
-    /// Close every store that has been idle past the timeout.
+    /// Seal one open store without closing it — the explicit checkpoint.
+    pub fn seal(&mut self, name: &str) -> Result<bool, SessionError> {
+        let index = self.resolve(name)?;
+        let now = self.clock.now();
+        self.stores[index].last_activity = now;
+        Ok(self.stores[index].seal()?)
+    }
+
+    /// Seal every open store, reporting each by alias.
+    pub fn seal_all(&mut self) -> Vec<(String, Result<bool, VaultError>)> {
+        let now = self.clock.now();
+        self.stores
+            .iter_mut()
+            .map(|store| {
+                store.last_activity = now;
+                (store.alias.clone(), store.seal())
+            })
+            .collect()
+    }
+
+    /// What this session has open, for the crash-recovery record.
+    pub fn records(&self) -> Vec<crate::orphan::StoreRecord> {
+        self.stores
+            .iter()
+            .filter_map(|store| {
+                Some(crate::orphan::StoreRecord {
+                    alias: store.alias.clone(),
+                    vault: store.vault.path().to_path_buf(),
+                    work: store.work_path()?.to_path_buf(),
+                    mode: store.vault.mode(),
+                })
+            })
+            .collect()
+    }
+
+    /// Notice edits made inside working directories and count them as activity.
     ///
-    /// Expiry is a *full* close rather than merely dropping the key: from M10 a
-    /// store also owns a plaintext working directory, and reporting "locked" while
-    /// that directory stayed readable would be a lie. Doing the full close here
-    /// keeps that the only meaning "expired" ever has.
-    pub fn expire(&mut self) -> Vec<Store> {
+    /// A user editing files in another window for twenty minutes is working, not
+    /// idle, and a timeout that only watched the prompt would seal the tree out
+    /// from under their editor. Cheap by construction — a stat walk, no file
+    /// contents — because it runs on a timer.
+    ///
+    /// Returns the aliases that had been touched, so a caller can say why a
+    /// countdown reset.
+    pub fn note_external_activity(&mut self) -> Vec<String> {
+        let now = self.clock.now();
+        let mut touched = Vec::new();
+        for store in &mut self.stores {
+            let Some(work) = &store.work else { continue };
+            let scan = work.scan();
+            if scan != store.last_scan {
+                store.last_scan = scan;
+                store.last_activity = now;
+                touched.push(store.alias.clone());
+            }
+        }
+        touched
+    }
+
+    /// Close every store that has been idle past the timeout, sealing first.
+    ///
+    /// Expiry is a *full* close rather than merely dropping the key: a store owns a
+    /// plaintext working directory, and reporting "locked" while that directory sat
+    /// readable on disk would be a lie. Each result carries whether that store was
+    /// written and any error, because an expiry that failed to seal must not
+    /// silently discard the tree it is about to delete.
+    pub fn expire(&mut self) -> Vec<ClosedStore> {
         let Some(timeout) = self.idle_timeout else {
             return Vec::new();
         };
@@ -227,7 +458,7 @@ impl Session {
         let mut index = 0;
         while index < self.stores.len() {
             if self.stores[index].idle_for(now) >= timeout {
-                expired.push(self.stores.remove(index));
+                expired.push(seal_and_take(self.stores.remove(index)));
             } else {
                 index += 1;
             }
@@ -615,6 +846,235 @@ mod tests {
         let entry_id = reopened.credentials()[0].id;
         let data_key = reopened.unlock_with(&entry_id, kek).unwrap();
         assert_eq!(&reopened.kv_get(&data_key, "github").unwrap()[..], b"token");
+    }
+
+    /// A dir vault, seeded with a tree, returned unlocked the way `open` would.
+    fn open_dir_vault(path: &Path, files: &[(&str, &[u8])]) -> (Vault, Zeroizing<[u8; 32]>) {
+        let (enrollment, kek) = test_enrollment("fidostorers.local");
+        let mut vault = Vault::create(path, Mode::Dir, &enrollment).unwrap();
+        let entry_id = vault.credentials()[0].id;
+        let data_key = vault.unlock_with(&entry_id, kek).unwrap();
+
+        let source = tempfile::tempdir().unwrap();
+        for (name, contents) in files {
+            let file = source.path().join(name);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, contents).unwrap();
+        }
+        vault.seal_dir(&data_key, source.path()).unwrap();
+        (vault, data_key)
+    }
+
+    #[test]
+    fn opening_a_dir_store_extracts_it_and_closing_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.fido");
+        let (vault, data_key) = open_dir_vault(&path, &[("a.txt", b"one")]);
+        let lock = VaultLock::acquire(&path).unwrap();
+        let work = dir.path().join("work");
+
+        let mut session = session(TestClock::new(), None);
+        let (store, report) = session
+            .open_with_work_dir(vault, data_key, lock, None, Some(&work))
+            .unwrap();
+        assert!(report.is_complete());
+        assert_eq!(store.work_path(), Some(work.as_path()));
+        assert_eq!(std::fs::read(work.join("a.txt")).unwrap(), b"one");
+
+        drop(session.close("backup").unwrap());
+        assert!(!work.exists(), "closing must remove the plaintext");
+    }
+
+    #[test]
+    fn an_untouched_store_is_closed_without_writing_the_vault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.fido");
+        let (vault, data_key) = open_dir_vault(&path, &[("a.txt", b"one")]);
+        let lock = VaultLock::acquire(&path).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut session = session(TestClock::new(), None);
+        session
+            .open_with_work_dir(vault, data_key, lock, None, Some(&dir.path().join("work")))
+            .unwrap();
+
+        let closed = session.close("backup").unwrap();
+        assert!(!closed.sealed.unwrap(), "nothing changed, nothing written");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "an unchanged store must leave the vault byte-identical"
+        );
+    }
+
+    #[test]
+    fn an_edit_is_sealed_on_close_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.fido");
+        let (vault, data_key) = open_dir_vault(&path, &[("a.txt", b"one")]);
+        let lock = VaultLock::acquire(&path).unwrap();
+        let work = dir.path().join("work");
+
+        let mut session = session(TestClock::new(), None);
+        session
+            .open_with_work_dir(vault, data_key, lock, None, Some(&work))
+            .unwrap();
+        std::fs::write(work.join("a.txt"), b"edited").unwrap();
+        std::fs::write(work.join("added.txt"), b"new").unwrap();
+
+        let closed = session.close("backup").unwrap();
+        assert!(
+            *closed.sealed.as_ref().unwrap(),
+            "an edited store must be written"
+        );
+        drop(closed);
+
+        // Reopen from scratch and confirm the vault really holds the edit.
+        let (_, kek) = test_enrollment("fidostorers.local");
+        let reopened = Vault::open(&path).unwrap();
+        let entry_id = reopened.credentials()[0].id;
+        let data_key = reopened.unlock_with(&entry_id, kek).unwrap();
+        let restored = dir.path().join("restored");
+        reopened.open_dir(&data_key, &restored).unwrap();
+        assert_eq!(std::fs::read(restored.join("a.txt")).unwrap(), b"edited");
+        assert_eq!(std::fs::read(restored.join("added.txt")).unwrap(), b"new");
+    }
+
+    #[test]
+    fn seal_writes_without_closing_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.fido");
+        let (vault, data_key) = open_dir_vault(&path, &[("a.txt", b"one")]);
+        let lock = VaultLock::acquire(&path).unwrap();
+        let work = dir.path().join("work");
+
+        let mut session = session(TestClock::new(), None);
+        session
+            .open_with_work_dir(vault, data_key, lock, None, Some(&work))
+            .unwrap();
+
+        assert!(!session.seal("backup").unwrap(), "nothing to write yet");
+        std::fs::write(work.join("a.txt"), b"edited").unwrap();
+        assert!(session.seal("backup").unwrap(), "a checkpoint writes");
+        assert!(
+            !session.seal("backup").unwrap(),
+            "sealing twice must not rewrite an unchanged store"
+        );
+
+        // And closing after an explicit seal has nothing left to do.
+        assert!(!session.close("backup").unwrap().sealed.unwrap());
+    }
+
+    #[test]
+    fn editing_a_working_directory_counts_as_activity() {
+        let clock = TestClock::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.fido");
+        let (vault, data_key) = open_dir_vault(&path, &[("a.txt", b"one")]);
+        let lock = VaultLock::acquire(&path).unwrap();
+        let work = dir.path().join("work");
+
+        let mut session = session(clock.clone(), Some(Duration::from_secs(900)));
+        session
+            .open_with_work_dir(vault, data_key, lock, None, Some(&work))
+            .unwrap();
+
+        clock.advance(Duration::from_secs(800));
+        // A user editing files in another window is working, not idle. Without
+        // this, the tree would be sealed out from under their editor.
+        std::fs::write(work.join("a.txt"), b"still working").unwrap();
+        assert_eq!(session.note_external_activity(), ["backup"]);
+
+        clock.advance(Duration::from_secs(800));
+        assert!(
+            session.expire().is_empty(),
+            "the edit should have reset the countdown"
+        );
+        clock.advance(Duration::from_secs(200));
+        assert_eq!(session.expire().len(), 1, "and then it expires as usual");
+    }
+
+    #[test]
+    fn expiry_seals_before_it_drops_the_key() {
+        let clock = TestClock::new();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.fido");
+        let (vault, data_key) = open_dir_vault(&path, &[("a.txt", b"one")]);
+        let lock = VaultLock::acquire(&path).unwrap();
+        let work = dir.path().join("work");
+
+        let mut session = session(clock.clone(), Some(Duration::from_secs(60)));
+        session
+            .open_with_work_dir(vault, data_key, lock, None, Some(&work))
+            .unwrap();
+        std::fs::write(work.join("a.txt"), b"edited just before stepping away").unwrap();
+
+        clock.advance(Duration::from_secs(61));
+        let expired = session.expire();
+        assert_eq!(expired.len(), 1);
+        assert!(
+            expired[0].sealed.as_ref().unwrap(),
+            "an idle timeout must not throw away unsaved work"
+        );
+        drop(expired);
+        assert!(
+            !work.exists(),
+            "expiry is a full close, not just a dropped key"
+        );
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_sealed_keeps_its_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.fido");
+        let (vault, data_key) = open_dir_vault(&path, &[("a.txt", b"one")]);
+        let lock = VaultLock::acquire(&path).unwrap();
+        let work = dir.path().join("work");
+
+        let mut session = session(TestClock::new(), None);
+        session
+            .open_with_work_dir(vault, data_key, lock, None, Some(&work))
+            .unwrap();
+        std::fs::write(work.join("a.txt"), b"edited").unwrap();
+
+        // Make the write fail by removing the vault's directory out from under it.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(crate::lock::lock_path(&path)).unwrap();
+        std::fs::remove_dir_all(dir.path().join("restored")).ok();
+        std::fs::create_dir_all(&path).unwrap(); // a directory where the file was
+
+        let closed = session.close("backup").unwrap();
+        assert!(closed.sealed.is_err(), "the seal should have failed");
+        drop(closed);
+        assert!(
+            work.join("a.txt").exists(),
+            "a failed seal must not delete the only copy of the user's changes"
+        );
+    }
+
+    #[test]
+    fn records_describe_the_stores_with_working_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("backup.fido");
+        let (vault, data_key) = open_dir_vault(&path, &[("a.txt", b"one")]);
+        let lock = VaultLock::acquire(&path).unwrap();
+        let work = dir.path().join("work");
+
+        let mut session = session(TestClock::new(), None);
+        session
+            .open_with_work_dir(vault, data_key, lock, None, Some(&work))
+            .unwrap();
+
+        // A kv store has no working directory and so nothing to recover.
+        let kv_path = dir.path().join("tokens.fido");
+        let (kv_vault, kv_key) = open_vault(&kv_path);
+        let kv_lock = VaultLock::acquire(&kv_path).unwrap();
+        session.open(kv_vault, kv_key, kv_lock, None).unwrap();
+
+        let records = session.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].alias, "backup");
+        assert_eq!(records[0].work, work);
     }
 
     #[test]

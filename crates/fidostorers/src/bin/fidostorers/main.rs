@@ -656,19 +656,31 @@ fn wrong_command_for_mode(mode: Mode) -> anyhow::Error {
 }
 
 /// Take the advisory lock for a command that is going to write.
-///
-/// Only writers take it. A session holds its stores' locks for as long as they are
-/// open, and making `info`, `unlock` or `kv get` fail for that whole time would
-/// trade a real convenience for no protection: reading cannot corrupt anything, and
-/// `Vault::write`'s rename means a reader either sees the old file or the new one.
-/// What the lock prevents is two writers, which is the collision that loses data.
 fn lock_for_write(vault: &Path) -> Result<VaultLock> {
     Ok(VaultLock::acquire(vault)?)
 }
 
+/// Refuse if a session, or another command, has this vault.
+///
+/// For commands that only read. **While a session holds a vault open, no other
+/// `fidostorers` process may open or write it** — reading included. A session's
+/// working directory can hold edits that are not in the vault file yet, so a reader
+/// would get a version that is about to be replaced, and reporting that as the
+/// vault's contents would be worse than refusing.
+///
+/// This takes no lock of its own, so concurrent readers never block each other;
+/// they only honour a lock somebody else holds.
+fn require_available(vault: &Path) -> Result<()> {
+    Ok(fidostorers::lock::ensure_available(vault)?)
+}
+
 /// Open a vault and confirm it is a kv vault before asking for a touch — telling
 /// someone they used the wrong subcommand should not cost them a key press.
+///
+/// Callers that write take the lock themselves first; this only refuses a vault
+/// somebody else holds.
 fn open_kv_vault(path: &Path) -> Result<Vault> {
+    require_available(path)?;
     let vault = Vault::open(path)?;
     if vault.mode() != Mode::Kv {
         bail!(
@@ -873,6 +885,7 @@ fn run() -> Result<i32> {
             output,
             auth,
         } => {
+            require_available(&path)?;
             let vault = Vault::open(&path)?;
             match vault.mode() {
                 Mode::File => {
@@ -983,6 +996,7 @@ fn run() -> Result<i32> {
             }
         },
         Commands::Info { vault } => {
+            require_available(&vault)?;
             // No touch, so no data key, so `header_mac` cannot be checked.
             print_vault_info(&Vault::open(&vault)?, false);
         }

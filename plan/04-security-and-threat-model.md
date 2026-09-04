@@ -143,10 +143,10 @@ Unchanged: tamper detection. Forging an entry still needs the data key, deleting
 relabelling one is still caught by `header_mac`, and editing a salt or the KDF
 parameters still produces the wrong KEK and fails the wrap tag.
 
-## Interactive mode: what a session weakens (M9)
+## Interactive mode: what a session weakens (M9, M10)
 
 `fidostorers interactive` ([08-interactive-mode.md](08-interactive-mode.md)) is
-implemented, and it reverses one of this document's standing guarantees. This
+implemented, and it reverses two of this document's standing guarantees. This
 section is written to describe what the tool does **today**, not what is planned.
 
 **"Every unlocking operation needs a live touch" is no longer true inside a
@@ -170,12 +170,36 @@ What bounds that window:
 - **Every key is zeroized on close**, on every path out: `close`, `exit`, EOF,
   `SIGTERM`/`SIGHUP`, and idle expiry all drop the same `Zeroizing` data key.
 
-**Plaintext on disk has *not* changed yet.** The working directories that would
-extract a `file` or `dir` store to a plaintext path — decision #15, and the larger
-of the two changes this section used to anticipate — are the next milestone. Today a
-`file`/`dir` store can be opened, which caches its key so `info`, `enroll` and
-`revoke` cost no further touches, but nothing is extracted and no plaintext reaches
-the filesystem from a session. `kv` stores never need a working directory at all.
+**Decrypted output on disk is no longer only "what the user explicitly asked to
+write."** Opening a `file` or `dir` store extracts it to a plaintext working
+directory that lives until the store is closed, so ordinary tools work on it. This
+is the larger of the two changes and the one this section exists for.
+
+What bounds it:
+
+- **Placement.** `$XDG_RUNTIME_DIR/fidostorers/...` by default, which on Linux is
+  normally a `tmpfs` — the plaintext lives in RAM and is cleared on logout — and the
+  system temp directory otherwise. Created `0700`. **Never beside the vault**, which
+  commonly sits in a synced folder, a git repo, or a backed-up home directory;
+  `--work-dir` warns if the destination looks like either.
+- **Lifetime.** Removed on `close`, on `exit`, and on idle expiry, which seals
+  first. A `kv` store never gets one at all.
+- **Windows.** There is no one-line equivalent of `0700`, so the directory inherits
+  the user profile's ACLs. A Windows working directory is **only as private as the
+  profile it sits in**; that is a limitation, not a protection.
+
+**Removing a working directory is `unlink`, not erasure — and secure erasure is an
+explicit non-goal.** On an SSD, a CoW filesystem, or any journalling filesystem,
+overwriting a file does not reliably destroy the prior contents, and nothing done
+from userspace changes that. Users who need plaintext never to reach stable storage
+should use a `kv` store, or point `--work-dir` at a tmpfs or ramdisk. The default
+location on Linux already is one.
+
+**A failed seal deliberately leaves plaintext behind.** If a store cannot be
+written, its working directory is the only copy of the user's changes, so it is kept
+and reported rather than deleted, and offered back by the next session. That is the
+right trade — losing data is worse than leaving a file on disk — but it does mean an
+interrupted or failing session can leave plaintext where a clean one would not.
 
 **A session is not yet hardened for the key lifetime it introduces.** `mlock`/
 `VirtualLock` pinning and core-dump suppression are M11 and are not implemented, so
@@ -186,10 +210,13 @@ described as safe until those land.
 **What does not change:** a vault at rest, with no session running, is exactly as
 protected as before. Tamper detection is untouched — a session verifies `header_mac`
 when it opens a store, which makes its `info` output *authenticated*, unlike the
-touchless one-shot `info`. Concurrent writers are excluded by an advisory
-`<vault>.lock`, which the one-shot writing commands honour too; readers are
-deliberately not excluded, since reading cannot corrupt a vault and a session holds
-its lock for minutes at a time.
+touchless one-shot `info`. **While a session holds a vault open, no other `fidostorers`
+process may open or write it** — reading included, because the session's working
+directory can hold edits the vault file does not have yet, so a reader would be
+handed a version that is about to be replaced. This is enforced by an advisory
+`<vault>.lock`; it is advisory, so a process that does not look for it is not
+stopped, and it excludes this tool's own commands, which is the collision that
+actually happens.
 
 ## Explicitly deferred (v2+ or "won't do")
 

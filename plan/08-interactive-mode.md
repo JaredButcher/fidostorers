@@ -4,48 +4,24 @@ A long-lived session that keeps a vault's data key in memory, so a user working 
 one or more vaults touches their security key once per vault rather than once per
 command.
 
-> **Status: the session core is implemented (M9). Working directories are not.**
+> **Status: implemented (M9 and M10).** Everything below describes what the tool
+> does, with these differences:
 >
-> What works today: `open`/`close`/`stores`/`seal`/`info`/`init`/`kv *`/`enroll`/
-> `revoke`/`help`/`exit`, aliases, the idle timeout and its warning, the advisory
-> lock, and graceful shutdown. `kv` stores work end to end.
+> - **Dirty tracking** is a digest of the bytes a seal would write, not the sketched
+>   manifest of path/size/mtime. `stores`' dirty column uses a cheaper stat scan and
+>   may over-report; the write is decided by the exact digest.
+> - **A seal that fails keeps its plaintext** rather than removing the working
+>   directory, and the store becomes an orphan for the next session.
+> - **The advisory lock excludes readers too**, not just writers as originally
+>   described here: a session's unsealed edits are not in the vault file, so no other
+>   `fidostorers` process may open or write a vault a session holds.
+> - **Secure erasure is an explicit non-goal**, and the default location on Linux
+>   (`$XDG_RUNTIME_DIR`) is already a tmpfs.
+> - **Ctrl+C cancellation** is narrower than the table below implies; see
+>   [06-roadmap.md](06-roadmap.md) M9.
 >
-> What is deferred to M10, and is described below as though it existed: the
-> **working directories** that extract a `file` or `dir` store to a plaintext path,
-> and everything that depends on them — dirty tracking and the `stores` dirty
-> column, a `seal` that actually writes, orphan recovery and its session file, and
-> interrupting a shutdown that is taking too long. Opening a `file`/`dir` store
-> today caches its key (so `info`, `enroll` and `revoke` need no further touches)
-> but extracts nothing.
->
-> Deviations from the design below that were deliberate rather than deferred are
-> recorded in [06-roadmap.md](06-roadmap.md) M9, "Refinements made while
-> implementing".
-
-```
-$ fidostorers interactive
-fidostorers 0.1.0 - type `help`, `exit` to seal everything and quit
-
-> open tokens.fido
-touch your security key...
-opened `tokens` (kv, 12 entries)
-
-> open backup.fido
-touch your security key...
-opened `backup` (dir) at /run/user/1000/fidostorers-a1b2/backup
-
-> kv get tokens github
-ghp_...
-
-> stores
-  tokens   kv    clean    idle 0m
-  backup   dir   dirty    idle 2m   /run/user/1000/fidostorers-a1b2/backup
-
-> exit
-sealing `backup` (2 files changed)... done
-`tokens` unchanged, nothing to write
-removed 1 working directory
-```
+> Full accounting in [06-roadmap.md](06-roadmap.md) M9/M10 and
+> [07-open-decisions.md](07-open-decisions.md) #21–#32.
 
 ## Why this is a deliberate reversal
 

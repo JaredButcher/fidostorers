@@ -11,13 +11,16 @@ mod error;
 pub mod keyfile;
 mod kv;
 pub mod lock;
+pub mod orphan;
 pub mod session;
 mod vault;
+pub mod workdir;
 
 pub use archive::{ExtractReport, SkippedEntry};
 pub use crypto::kek_from_secret;
 pub use error::VaultError;
 pub use keyfile::KeyfileParams;
 pub use lock::VaultLock;
-pub use session::{Session, SessionError, Store};
+pub use session::{ClosedStore, Session, SessionError, Store};
 pub use vault::{Enrollment, Factor, FactorEntry, Mode, Vault, FORMAT_VERSION};
+pub use workdir::WorkDir;

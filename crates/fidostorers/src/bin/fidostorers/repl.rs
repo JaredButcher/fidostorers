@@ -10,22 +10,23 @@
 //! be: the terminal, the signals, and the orchestration that turns a typed line
 //! into a `Vault` call.
 //!
-//! **Working directories for `file` and `dir` stores are not here yet** — they are
-//! the next milestone, and they are the part that puts plaintext on disk. So a
-//! `file`/`dir` store can be opened (its key is cached, so `info`, `enroll` and
-//! `revoke` need no further touches) but its contents are not extracted, and `kv`
-//! stores are the ones that work end to end.
+//! Opening a `file` or `dir` store extracts it to a plaintext **working
+//! directory** so ordinary tools work on it, and closing seals it back. That is the
+//! part of this design that puts unencrypted user data in the filesystem; where it
+//! goes and what removing it does and does not guarantee are in
+//! [`fidostorers::workdir`]. A `kv` store needs no such thing and stays
+//! memory-only.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
-use fidostorers::session::{Session, SystemClock};
-use fidostorers::{Mode, Vault, VaultLock};
+use fidostorers::session::{ClosedStore, Session, SystemClock};
+use fidostorers::{orphan, workdir, Mode, Vault, VaultLock};
 use rustyline::error::ReadlineError;
 use rustyline::{Config, DefaultEditor, ExternalPrinter};
 
@@ -34,9 +35,21 @@ use crate::{
     KvValueSource,
 };
 
+/// Where a session keeps its state: the runtime root shared by every session on
+/// this machine, and this session's own directory for working trees.
+struct Paths {
+    root: PathBuf,
+    work_base: PathBuf,
+}
+
 /// How often the idle watchdog looks at the session. Short enough that `exit`
 /// does not visibly wait on it, long enough to cost nothing.
 const WATCHDOG_TICK: Duration = Duration::from_millis(250);
+
+/// How often the watchdog re-scans working directories for edits made outside the
+/// REPL. Far less often than it checks the clock: the scan walks every open tree,
+/// and five-second granularity is irrelevant against a fifteen-minute timeout.
+const SCAN_EVERY: u32 = 20;
 
 /// One line typed at the prompt.
 ///
@@ -76,6 +89,11 @@ enum ReplCommand {
         /// know that process is gone.
         #[arg(long)]
         force: bool,
+        /// Extract a file or dir store here instead of the private runtime
+        /// directory. Must not already contain anything. Keep it off cloud sync and
+        /// out of git: whatever lands here is plaintext.
+        #[arg(long, value_name = "PATH")]
+        work_dir: Option<PathBuf>,
         #[command(flatten)]
         auth: AuthArgs,
     },
@@ -205,6 +223,13 @@ pub fn run(args: &InteractiveArgs) -> Result<i32> {
     )));
     let signals = signals::install();
 
+    let root = workdir::runtime_root();
+    workdir::create_private_dir(&root).with_context(|| format!("preparing {}", root.display()))?;
+    let paths = Paths {
+        work_base: workdir::new_session_dir(&root)?,
+        root,
+    };
+
     // History is in memory and cannot reach disk: with rustyline's
     // `with-file-history` feature off, `DefaultHistory` *is* the in-memory one, so
     // `kv set --value <secret>` has nowhere to be persisted to. plan/08 asks for
@@ -216,29 +241,188 @@ pub fn run(args: &InteractiveArgs) -> Result<i32> {
 
     banner(idle_timeout);
 
+    // Before anything else: a previous session may have died holding plaintext.
+    if let Err(err) = recover_orphans(&mut editor, &paths) {
+        report(&err);
+    }
+
     let watchdog = Watchdog::spawn(
         Arc::clone(&session),
         editor.create_external_printer().ok(),
         idle_warning,
     );
 
-    let exit_code = main_loop(&mut editor, &session, &signals);
+    let loop_result = main_loop(&mut editor, &session, &signals, &paths);
     watchdog.stop();
 
-    let closed = session.lock().expect("session mutex").close_all();
-    if !closed.is_empty() {
-        println!(
-            "closing {}",
-            closed
-                .iter()
-                .map(|s| s.alias().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+    let shutdown_code = shutdown(&session, &signals, &paths);
+    // The session directory is ours and is empty once every store has closed;
+    // leaving it behind would accumulate one per session ever run.
+    let _ = std::fs::remove_dir(&paths.work_base);
+
+    // A failure in the loop outranks the shutdown's own result; otherwise the
+    // shutdown decides, since that is where sealing happens.
+    match loop_result {
+        Ok(0) => Ok(shutdown_code),
+        other => other,
     }
-    // Dropping each `Store` zeroizes its data key and releases its vault lock.
-    drop(closed);
-    exit_code
+}
+
+/// Close every store, sealing as we go, and report what was written.
+///
+/// Interruptible *between* stores: a Ctrl+C during a long shutdown stops the ones
+/// not yet reached rather than abandoning a write half-done. Anything not sealed
+/// keeps its plaintext, so nothing is silently thrown away.
+fn shutdown(session: &Arc<Mutex<Session>>, signals: &signals::Signals, paths: &Paths) -> i32 {
+    let stores = session.lock().expect("session mutex").take_all();
+    let mut failed = false;
+    let mut retained: Vec<PathBuf> = Vec::new();
+    let mut stores = stores.into_iter().peekable();
+
+    while let Some(store) = stores.next() {
+        if signals.take_cancel() {
+            let mut abandoned = vec![store];
+            abandoned.extend(stores);
+            eprintln!(
+                "interrupted: {} store(s) not sealed. Their plaintext is left in place and \
+                 will be offered back the next time you start a session.",
+                abandoned.len()
+            );
+            for mut store in abandoned {
+                store.keep_plaintext();
+                if let Some(path) = store.work_path() {
+                    retained.push(path.to_path_buf());
+                }
+            }
+            failed = true;
+            break;
+        }
+
+        let alias = store.alias().to_string();
+        let closed = ClosedStore::seal(store);
+        match &closed.sealed {
+            Ok(true) => println!("sealed {alias:?}"),
+            Ok(false) => println!("{alias:?} unchanged, nothing to write"),
+            Err(err) => {
+                eprintln!("error: could not seal {alias:?}: {err}");
+                failed = true;
+                if let Some(path) = closed.store.work_path() {
+                    retained.push(path.to_path_buf());
+                }
+            }
+        }
+        // Dropping the store zeroizes its data key, releases its vault lock, and
+        // removes its working directory — unless a failed seal kept it.
+        drop(closed);
+    }
+
+    for path in &retained {
+        eprintln!("  plaintext kept at {}", path.display());
+    }
+    if retained.is_empty() {
+        orphan::clear_record(&paths.root);
+    } else {
+        // Leave the record: those trees are now orphans, and the record is how the
+        // next session finds them.
+        eprintln!("Start a session again to seal or discard them.");
+    }
+
+    if failed {
+        crate::EXIT_ERROR
+    } else {
+        0
+    }
+}
+
+/// Offer back any working directory left by a session that did not exit cleanly.
+fn recover_orphans(editor: &mut DefaultEditor, paths: &Paths) -> Result<()> {
+    for orphan in orphan::find(&paths.root) {
+        println!();
+        println!("Found an unsealed working directory from a session that did not exit cleanly:");
+        println!("  vault:   {}", orphan.store.vault.display());
+        println!("  work:    {}", orphan.store.work.display());
+        println!(
+            "  holds:   {} entr{}{}",
+            orphan.entries,
+            if orphan.entries == 1 { "y" } else { "ies" },
+            match orphan.last_modified {
+                Some(_) => ", last modified since that session started",
+                None => "",
+            }
+        );
+
+        loop {
+            let answer = match editor
+                .readline("  [s]eal it into the vault  [d]iscard it  [l]eave it for now: ")
+            {
+                Ok(answer) => answer,
+                // EOF here means "not now", which is the safe reading: leaving it
+                // writes nothing and the prompt returns next session.
+                Err(_) => return Ok(()),
+            };
+            match answer.trim() {
+                "s" | "seal" => {
+                    match seal_orphan(editor, &orphan) {
+                        Ok(()) => {
+                            println!("  sealed into {}", orphan.store.vault.display());
+                            discard_tree(&orphan.store.work);
+                            orphan::resolve(&orphan)?;
+                        }
+                        // Do not resolve: a failed seal must be offered again
+                        // rather than quietly dropped.
+                        Err(err) => report(&err),
+                    }
+                    break;
+                }
+                "d" | "discard" => {
+                    discard_tree(&orphan.store.work);
+                    orphan::resolve(&orphan)?;
+                    println!("  discarded");
+                    break;
+                }
+                "l" | "leave" | "" => {
+                    println!("  left in place; you will be asked again next session");
+                    break;
+                }
+                _ => continue,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Seal an orphan's tree into its vault. The data key died with the old process, so
+/// this costs a fresh unlock.
+fn seal_orphan(editor: &mut DefaultEditor, orphan: &orphan::Orphan) -> Result<()> {
+    let mut vault = Vault::open(&orphan.store.vault)?;
+    let _lock = VaultLock::acquire(&orphan.store.vault)?;
+
+    let keyfile = editor
+        .readline("  keyfile to unlock with (blank for a security key): ")
+        .unwrap_or_default();
+    let keyfile = keyfile.trim();
+    let auth = AuthArgs {
+        keyfile: (!keyfile.is_empty()).then(|| PathBuf::from(keyfile)),
+        password_stdin: false,
+        id: None,
+        require_uv: false,
+    };
+
+    let data_key = unlock_vault(&vault, &auth, &Interrupt::none())?;
+    match orphan.store.mode {
+        Mode::File => vault.seal_file(&data_key, &orphan.store.work)?,
+        Mode::Dir => vault.seal_dir(&data_key, &orphan.store.work)?,
+        Mode::Kv => bail!("a kv store has no working directory to recover"),
+    }
+    Ok(())
+}
+
+fn discard_tree(path: &Path) {
+    let _ = if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
 }
 
 fn banner(idle_timeout: Option<Duration>) {
@@ -261,9 +445,10 @@ fn banner(idle_timeout: Option<Duration>) {
          running session as equivalent to a vault at rest."
     );
     eprintln!(
-        "Opening a file or dir store caches its key — so `info`, `enroll` and `revoke`\n\
-         cost no further touches — but does not extract its contents. kv stores are\n\
-         fully usable here."
+        "Opening a file or dir store extracts it to a PLAINTEXT working directory that\n\
+         lives until you close the store; closing seals your changes back and removes\n\
+         it. Removal is deletion, not secure erasure — keep the working directory on a\n\
+         tmpfs or ramdisk if that matters. kv stores need no working directory."
     );
     eprintln!();
 }
@@ -272,6 +457,7 @@ fn main_loop(
     editor: &mut DefaultEditor,
     session: &Arc<Mutex<Session>>,
     signals: &signals::Signals,
+    paths: &Paths,
 ) -> Result<i32> {
     loop {
         if signals.shutdown_requested() {
@@ -285,7 +471,7 @@ fn main_loop(
                 // not acted on mid-operation (plan/08, "Signals during a write"):
                 // between commands is the first safe moment to notice it.
                 signals.take_cancel();
-                match dispatch(&line, session, signals) {
+                match dispatch(&line, session, signals, paths) {
                     Ok(Flow::Continue) => {}
                     Ok(Flow::Exit) => return Ok(0),
                     Err(err) => report(&err),
@@ -329,7 +515,12 @@ fn report(err: &anyhow::Error) {
     }
 }
 
-fn dispatch(line: &str, session: &Arc<Mutex<Session>>, signals: &signals::Signals) -> Result<Flow> {
+fn dispatch(
+    line: &str,
+    session: &Arc<Mutex<Session>>,
+    signals: &signals::Signals,
+    paths: &Paths,
+) -> Result<Flow> {
     let tokens = match crate::tokenize::tokenize(line) {
         Ok(tokens) => tokens,
         Err(err) => bail!("{err}"),
@@ -348,13 +539,14 @@ fn dispatch(line: &str, session: &Arc<Mutex<Session>>, signals: &signals::Signal
         }
     };
 
-    execute(parsed.command, session, signals)
+    execute(parsed.command, session, signals, paths)
 }
 
 fn execute(
     command: ReplCommand,
     session: &Arc<Mutex<Session>>,
     signals: &signals::Signals,
+    paths: &Paths,
 ) -> Result<Flow> {
     match command {
         ReplCommand::Exit => return Ok(Flow::Exit),
@@ -363,9 +555,19 @@ fn execute(
             vault: path,
             alias,
             force,
+            work_dir,
             auth,
         } => {
-            open_store(session, &path, alias, force, &auth, signals)?;
+            open_store(
+                session,
+                &path,
+                alias,
+                force,
+                work_dir.as_deref(),
+                &auth,
+                signals,
+                paths,
+            )?;
         }
 
         ReplCommand::Init {
@@ -416,8 +618,9 @@ fn execute(
             if closed.is_empty() {
                 println!("no open stores");
             }
-            for store in &closed {
-                println!("closed {:?}", store.alias());
+            record_open_stores(&session, paths);
+            for closed in &closed {
+                report_close(closed);
             }
         }
 
@@ -428,13 +631,25 @@ fn execute(
             }
             let now = session.now();
             for store in session.stores() {
+                // A cheap stat scan, not a full read: `stores` is a status display
+                // and must stay instant even for a large tree. The exact check is
+                // the one that decides a write, at seal time.
+                let state = match store.work_path() {
+                    None => "-",
+                    Some(_) if store.looks_touched() => "changed",
+                    Some(_) => "clean",
+                };
                 println!(
-                    "  {:<12} {:<5} idle {:<6} {}",
+                    "  {:<12} {:<5} {:<8} idle {:<6} {}",
                     store.alias(),
                     store.vault().mode().to_string(),
+                    state,
                     format_duration(store.idle_for(now)),
                     store.path().display()
                 );
+                if let Some(work) = store.work_path() {
+                    println!("       work: {}", work.display());
+                }
             }
         }
 
@@ -448,18 +663,30 @@ fn execute(
         }
 
         ReplCommand::Seal { target } => {
-            let session = session.lock().expect("session mutex");
-            if target != "all" {
-                session.get(&target)?;
+            let mut session = session.lock().expect("session mutex");
+            let results = if target == "all" {
+                session.seal_all()
+            } else {
+                let wrote = session.seal(&target)?;
+                vec![(session.get(&target)?.alias().to_string(), Ok(wrote))]
+            };
+            if results.is_empty() {
+                println!("no open stores");
             }
-            // Honest rather than a silent no-op: `seal` flushes a working directory,
-            // and working directories are the next milestone. Until then every
-            // change a session makes is written to the vault as it is made.
-            println!(
-                "nothing to seal: every change is written to the vault file as you make it.\n\
-                 `seal` becomes meaningful once file and dir stores are extracted to a\n\
-                 working directory."
-            );
+            let mut failed = false;
+            for (alias, result) in results {
+                match result {
+                    Ok(true) => println!("sealed {alias:?}"),
+                    Ok(false) => println!("{alias:?} unchanged, nothing to write"),
+                    Err(err) => {
+                        eprintln!("error: could not seal {alias:?}: {err}");
+                        failed = true;
+                    }
+                }
+            }
+            if failed {
+                bail!("some stores could not be sealed; their working directories are unchanged");
+            }
         }
 
         ReplCommand::Kv { command } => return kv(command, session).map(|()| Flow::Continue),
@@ -544,13 +771,16 @@ fn execute(
     Ok(Flow::Continue)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_store(
     session: &Arc<Mutex<Session>>,
-    path: &std::path::Path,
+    path: &Path,
     alias: Option<String>,
     force: bool,
+    work_dir: Option<&Path>,
     auth: &AuthArgs,
     signals: &signals::Signals,
+    paths: &Paths,
 ) -> Result<()> {
     // Check this session first. The lock below would otherwise report the vault as
     // busy with a lock this very process holds, which is true but useless.
@@ -573,6 +803,19 @@ fn open_store(
     }
 
     let vault = Vault::open(path)?;
+    let mode = vault.mode();
+    let work_path = match (mode, work_dir) {
+        (Mode::Kv, Some(_)) => {
+            bail!("a kv store has no working directory, so --work-dir does nothing here")
+        }
+        (Mode::Kv, None) => None,
+        (mode, Some(chosen)) => Some(prepare_work_dir(chosen, mode)?),
+        (_, None) => Some(workdir::work_path_for(
+            &paths.work_base,
+            alias.as_deref().unwrap_or(&default_alias(path)),
+        )),
+    };
+
     let lock = if force {
         if let Some(info) = fidostorers::lock::holder(path) {
             eprintln!(
@@ -591,16 +834,113 @@ fn open_store(
     let data_key = unlock_vault(&vault, auth, &Interrupt::watching(signals.cancel_flag()))?;
 
     let mut session = session.lock().expect("session mutex");
-    let store = session.open(vault, data_key, lock, alias)?;
-    let mode = store.vault().mode();
-    println!("opened {:?} ({mode})", store.alias());
-    if mode != Mode::Kv {
-        println!(
-            "  its key is cached, so `info`, `enroll` and `revoke` need no further touches.\n\
-             \x20 Extracting its contents to a working directory is not implemented yet."
+    let (store, report) =
+        session.open_with_work_dir(vault, data_key, lock, alias, work_path.as_deref())?;
+
+    match store.work_path() {
+        Some(work) => println!("opened {:?} ({mode}) at {}", store.alias(), work.display()),
+        None => println!("opened {:?} ({mode})", store.alias()),
+    }
+    if report.modes_ignored {
+        eprintln!(
+            "warning: this platform has no Unix mode bits, so permissions in the archive \
+             were not applied. They are still stored, and will be preserved when this \
+             store is sealed."
         );
     }
+    for skipped in &report.skipped {
+        eprintln!(
+            "warning: skipped {}: {}",
+            skipped.path.display(),
+            skipped.reason
+        );
+    }
+    if !report.is_complete() {
+        eprintln!(
+            "{} entr{} could not be extracted, so this working directory is INCOMPLETE. \
+             Sealing it would write back a tree missing those entries — close without \
+             changing anything, or discard your changes, unless you know better.",
+            report.skipped.len(),
+            if report.skipped.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+    }
+    record_open_stores(&session, paths);
     Ok(())
+}
+
+/// Validate a `--work-dir` the user chose.
+///
+/// It must be empty or absent, because closing the store removes what we put there
+/// and we must never delete something the user already had. The sync check is the
+/// same one the keyfile warnings use, for the same reason: anything written into a
+/// synced folder or a git repo is about to be copied somewhere else, and here that
+/// something is plaintext.
+fn prepare_work_dir(chosen: &Path, mode: Mode) -> Result<PathBuf> {
+    // A `file` store's working path *is* the file, so anything already there would
+    // be overwritten on open and deleted on close.
+    if chosen.exists() {
+        match mode {
+            Mode::File => bail!(
+                "{chosen:?} already exists; --work-dir for a file store must be a path that \
+                 does not exist yet, since the store is written there directly"
+            ),
+            _ if !chosen.is_dir() => bail!("{chosen:?} is not a directory"),
+            _ if chosen.read_dir()?.next().is_some() => {
+                bail!("{chosen:?} is not empty; --work-dir must be an empty or new directory")
+            }
+            _ => {}
+        }
+    }
+    if workdir::looks_synced(chosen) {
+        eprintln!(
+            "warning: {} looks like a git repository or a synced folder. Everything \
+             extracted there is PLAINTEXT, and sync or version history would keep a copy \
+             long after this store is closed.",
+            chosen.display()
+        );
+    }
+    Ok(chosen.to_path_buf())
+}
+
+/// Record what is open, so a session that is killed can be recovered from.
+///
+/// Rewritten whenever the open set changes rather than only at startup, so the
+/// record always matches what is actually extracted.
+fn record_open_stores(session: &Session, paths: &Paths) {
+    if let Err(err) = orphan::write_record(&paths.root, session.records()) {
+        // Not fatal: the session still works, it just would not be recoverable.
+        eprintln!("warning: could not record open stores for crash recovery: {err}");
+    }
+}
+
+fn report_close(closed: &ClosedStore) {
+    match &closed.sealed {
+        Ok(true) => println!("sealed and closed {:?}", closed.alias()),
+        Ok(false) => println!("closed {:?} (unchanged)", closed.alias()),
+        Err(err) => {
+            eprintln!("error: could not seal {:?}: {err}", closed.alias());
+            if let Some(path) = closed.store.work_path() {
+                eprintln!("  plaintext kept at {}", path.display());
+            }
+        }
+    }
+}
+
+/// The alias a vault gets when the user does not name one: its file stem.
+fn default_alias(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if stem.is_empty() {
+        "store".to_string()
+    } else {
+        stem
+    }
 }
 
 fn kv(command: ReplKvCommand, session: &Arc<Mutex<Session>>) -> Result<()> {
@@ -717,6 +1057,7 @@ impl Watchdog {
             let mut printer = printer;
             // Warn once per idle period, not once per tick.
             let mut warned: Vec<String> = Vec::new();
+            let mut ticks: u32 = 0;
 
             let mut emit = move |message: String| match printer.as_mut() {
                 // Printing through rustyline redraws the prompt around the message,
@@ -729,6 +1070,8 @@ impl Watchdog {
 
             while stop.load(Ordering::Relaxed) {
                 std::thread::sleep(WATCHDOG_TICK);
+                ticks = ticks.wrapping_add(1);
+
                 let mut session = match session.lock() {
                     Ok(session) => session,
                     Err(_) => return,
@@ -737,12 +1080,32 @@ impl Watchdog {
                     continue;
                 }
 
-                for store in session.expire() {
-                    warned.retain(|alias| alias != store.alias());
-                    emit(format!(
-                        "\n{:?} was idle too long: closed, key dropped.",
-                        store.alias()
-                    ));
+                // Editing files in another window is working, not idling. Done on a
+                // slower cadence than the clock check because it walks every open
+                // tree, and five-second granularity is irrelevant against a
+                // fifteen-minute timeout.
+                if ticks % SCAN_EVERY == 0 {
+                    for alias in session.note_external_activity() {
+                        warned.retain(|warned| warned != &alias);
+                    }
+                }
+
+                for closed in session.expire() {
+                    warned.retain(|alias| alias != closed.alias());
+                    let alias = closed.alias().to_string();
+                    match &closed.sealed {
+                        Ok(true) => emit(format!(
+                            "\n{alias:?} was idle too long: sealed, closed, key dropped."
+                        )),
+                        Ok(false) => emit(format!(
+                            "\n{alias:?} was idle too long: closed unchanged, key dropped."
+                        )),
+                        Err(err) => emit(format!(
+                            "\n{alias:?} was idle too long, but could not be sealed: {err}\n\
+                             Its plaintext is left in place and will be offered back next \
+                             session."
+                        )),
+                    }
                 }
 
                 let expiring = session.expiring_within(idle_warning);

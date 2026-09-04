@@ -389,20 +389,68 @@ way to catch them. Both are pure Rust; `cargo audit` reports no advisories.
 
 ## M10 — Working directories for `file` and `dir` stores
 
-The part that puts plaintext on disk, and the reason it is its own milestone. M9
-built the session around their absence, so the additions are: extraction at `open`,
-a dirty flag and the `stores` column that shows it, a `seal` that writes, and a
-shutdown slow enough to be worth interrupting.
+**Code: done. Hardware validation: outstanding.**
 
-- Extraction on `open` to `$XDG_RUNTIME_DIR`/temp, mode `0700`, never beside the vault
-  by default; `--work-dir` with a warning when the destination looks like a git repo
-  or a sync folder.
-- Manifest-based dirty tracking, so an unchanged store is not rewritten on exit.
-- Idle-timeout expiry performs a full close, and counts working-directory
-  modifications as activity.
-- Orphan recovery: a session file, dead-pid detection at startup, and a per-store
-  seal/discard/leave prompt.
-- Honest documentation that cleanup is unlinking, not secure erasure.
+The part that puts plaintext on disk, and the reason it is its own milestone.
+
+- [x] Extraction on `open` to `$XDG_RUNTIME_DIR`/temp, mode `0700`, never beside the
+  vault by default; `--work-dir` with a warning when the destination looks like a
+  git repo or a sync folder, and a refusal if it already holds anything.
+- [x] Digest-based dirty tracking, so an unchanged store is not rewritten on exit.
+- [x] Idle-timeout expiry performs a full close — sealing first — and counts
+  working-directory modifications as activity.
+- [x] Orphan recovery: a per-pid session record, dead-pid detection at startup, and
+  a per-store seal/discard/leave prompt where "leave" is repeatable.
+- [x] `seal` writes for real; `close` and shutdown report what was written; a
+  shutdown is interruptible between stores.
+- [x] **No other `fidostorers` process may open or write a vault a session holds**,
+  reading included ([07-open-decisions.md](07-open-decisions.md) #22, revised).
+- [x] Honest documentation that cleanup is unlinking, not secure erasure — now
+  stated as an explicit non-goal (#30).
+- [x] Hardware-free tests: extraction, edit detection across contents, permissions,
+  additions and deletions, seal/close/expiry paths, orphan detection and
+  resolution, plus end-to-end tests that edit a real working directory through a
+  real session and one that kills a session and recovers the orphan.
+- [ ] Manual check with a physical key, and on Windows, where the working directory
+  inherits profile ACLs rather than being `0700` and where a `dir` payload's
+  symlinks may not extract at all.
+
+### Refinements made while implementing
+
+1. **One digest replaces the manifest.** plan/08 sketched a manifest of path, size
+   and mtime plus a hash for `file` mode. What shipped is `SHA-256` of exactly the
+   bytes a seal would write — the file's contents, or `archive::build`'s
+   deterministic tar. It answers the real question rather than approximating it,
+   cannot miss a change that preserved size and mtime, and returns the payload it
+   just built so a dirty store is sealed without walking the tree twice. The
+   baseline is the tree **as extracted**: `extract` does not restore mtimes, so
+   digesting the archive that produced the tree would mark every store dirty
+   immediately. See [07-open-decisions.md](07-open-decisions.md) #27.
+2. **`stores` uses a cheap scan, and may over-report.** The exact check reads every
+   byte; a status display must stay instant on a large tree. `stores` walks stat
+   metadata only, so it can say "changed" for a tree that would seal to identical
+   bytes. It never decides anything — the write is decided by the exact digest at
+   seal time (#28).
+3. **A failed seal keeps its plaintext.** Closing normally removes the working
+   directory; if the seal failed, that tree is the only copy of the user's changes,
+   so it is kept, its path printed, and the session exits non-zero. It then becomes
+   an orphan the next session offers back. The same rule covers a shutdown
+   interrupted by Ctrl+C (#29) — which is also what finally makes M9's deferred
+   "interrupt a slow shutdown" meaningful, since shutdown now does real work.
+4. **Reader exclusion reverses an M9 decision.** M9 deliberately let one-shot
+   readers past the lock. A working directory makes that wrong, because a session's
+   unsealed edits are not in the vault file yet. Implemented as two operations, not
+   a lock mode: writers `acquire`, readers `ensure_available` (check without
+   taking), so concurrent readers still never block each other and a writer does not
+   exclude itself (#22).
+5. **Session records are rewritten on every change to the open set**, not written
+   once at startup, so a crash at any moment leaves a record matching what is
+   actually extracted (#32).
+6. **Secure erasure is a stated non-goal**, not a caveat. Removing a working
+   directory is `unlink`, and no userspace overwrite makes that reliable on modern
+   filesystems. Users who need plaintext never to reach stable storage keep the
+   working directory on a tmpfs or ramdisk — which the default location already is
+   on Linux (#30).
 
 ## M11 — Hardening to match the longer key lifetime
 

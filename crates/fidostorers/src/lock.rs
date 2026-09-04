@@ -128,6 +128,34 @@ impl Drop for VaultLock {
     }
 }
 
+/// Refuse if anyone holds `vault`, without taking the lock.
+///
+/// For commands that only read. A session holds its stores' locks for as long as
+/// they are open, and while it does, **no other `fidostorers` process may open or
+/// write that vault** — including to read it, because a session's working directory
+/// can hold edits that are not in the file yet, so what a reader would get is a
+/// version that is about to be replaced.
+///
+/// Taking nothing means concurrent readers never block each other; they only ever
+/// honour a lock somebody else holds.
+pub fn ensure_available(vault: &Path) -> Result<(), VaultError> {
+    let path = lock_path(vault);
+    if !path.exists() {
+        return Ok(());
+    }
+    match read_info(&path) {
+        // Our own lock is not a conflict. A writing command takes the lock and then
+        // opens the vault through the same check a reader uses, so without this it
+        // would refuse itself.
+        Some(info) if info.pid == std::process::id() && info.hostname == hostname() => Ok(()),
+        // A holder we can prove is gone is not a holder. The lock file is left
+        // alone: clearing it is a writer's job, and a reader that tidied up would
+        // be mutating a vault's directory to answer a question.
+        Some(info) if is_stale(&info) => Ok(()),
+        holder => Err(busy(vault, holder)),
+    }
+}
+
 /// Who holds `vault`'s lock, if anyone. `None` also covers an unreadable or
 /// malformed lock file, which is why callers must not read it as "free".
 pub fn holder(vault: &Path) -> Option<LockInfo> {
@@ -169,7 +197,17 @@ fn busy(vault: &Path, holder: Option<LockInfo>) -> VaultError {
 /// a lock recorded on another machine, or on a platform with no liveness check,
 /// stays until the user says otherwise with `--force`.
 fn is_stale(info: &LockInfo) -> bool {
-    info.hostname == hostname() && process_is_alive(info.pid) == Some(false)
+    is_definitely_gone(info.pid, &info.hostname)
+}
+
+/// Whether `pid` on `host` is certainly not running any more.
+///
+/// The conservative half of every "is this leftover state safe to touch?" question
+/// in the crate — vault locks here, and session records in [`crate::orphan`]. It
+/// answers `false` whenever the answer is unknown, so the failure mode is an
+/// unnecessary `--force` rather than trampling a live process's state.
+pub(crate) fn is_definitely_gone(pid: u32, host: &str) -> bool {
+    host == hostname() && process_is_alive(pid) == Some(false)
 }
 
 /// `Some(false)` only when the answer is certain.
@@ -192,7 +230,7 @@ fn process_is_alive(pid: u32) -> Option<bool> {
 
 /// Best effort, and only ever compared against itself, so a wrong answer costs an
 /// unnecessary `--force` rather than a stolen lock.
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     #[cfg(target_os = "linux")]
     {
         if let Ok(name) = std::fs::read_to_string("/proc/sys/kernel/hostname") {
@@ -311,6 +349,73 @@ mod tests {
         let held = VaultLock::acquire(&vault).expect("a stale lock must not block");
         assert_eq!(holder(&vault).unwrap().pid, std::process::id());
         drop(held);
+    }
+
+    /// A lock file as some *other* live process would have written it. Another
+    /// host, so liveness is unknowable from here and the lock is therefore held —
+    /// which is the state a reader has to honour.
+    fn write_foreign_lock(vault: &Path) {
+        let info = LockInfo {
+            pid: 4321,
+            hostname: "some-other-machine".to_string(),
+            acquired_unix: 0,
+            vault: vault.to_path_buf(),
+        };
+        std::fs::write(lock_path(vault), serde_json::to_vec(&info).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn ensure_available_honours_someone_elses_lock_without_taking_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_path(&dir);
+        assert!(ensure_available(&vault).is_ok());
+
+        write_foreign_lock(&vault);
+        // Reading is refused too: a session's working directory can hold edits the
+        // vault file does not have yet.
+        assert!(matches!(
+            ensure_available(&vault),
+            Err(VaultError::VaultBusy { .. })
+        ));
+    }
+
+    #[test]
+    fn a_writer_does_not_refuse_its_own_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_path(&dir);
+        // `kv set` takes the lock, then opens the vault through the reader check.
+        let _held = VaultLock::acquire(&vault).unwrap();
+        ensure_available(&vault).expect("a process must not exclude itself");
+    }
+
+    #[test]
+    fn two_readers_never_block_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_path(&dir);
+        // Readers take nothing, so checking twice must not create a lock that the
+        // second check then trips over.
+        ensure_available(&vault).unwrap();
+        ensure_available(&vault).unwrap();
+        assert!(holder(&vault).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reader_ignores_a_provably_dead_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = vault_path(&dir);
+        let stale = LockInfo {
+            pid: 0,
+            hostname: hostname(),
+            acquired_unix: 0,
+            vault: vault.clone(),
+        };
+        let lock_file = lock_path(&vault);
+        std::fs::write(&lock_file, serde_json::to_vec(&stale).unwrap()).unwrap();
+
+        ensure_available(&vault).unwrap();
+        // ...and leaves the tidying to whoever writes next.
+        assert!(lock_file.exists());
     }
 
     #[test]
