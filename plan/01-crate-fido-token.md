@@ -161,10 +161,10 @@ Global: -v/-vv raise log verbosity (-vv includes the full CTAP2 exchange),
 
 Exit codes distinguish "no device found" (3), "timed out" (4), "user declined" (5),
 "wrong key touched" (6), "no hmac-secret support" (7), "PIN required or locked
-out" (8), "device present but unopenable — the Windows elevation case" (9), and
-generic transport errors (10), so crate 2's CLI can give good error messages without
-re-deriving that logic. The full table is in
-[../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md).
+out" (8), "device present but unopenable — the Windows elevation case" (9), generic
+transport errors (10) and a failed `selftest` (11), so crate 2's CLI can give good
+error messages without re-deriving that logic. The full table is in
+[../docs/fido-token.md](../docs/fido-token.md#exit-codes).
 
 ## Error type (sketch)
 

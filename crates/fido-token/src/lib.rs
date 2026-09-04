@@ -1,16 +1,75 @@
 //! FIDO2/U2F device communication.
 //!
-//! This crate isolates every bit of CTAP2/HID hardware interaction behind the
-//! [`Authenticator`] trait, so that consumers (including this crate's own tests)
-//! never have to depend on physical hardware directly. See
-//! `plan/01-crate-fido-token.md` for the full design rationale.
+//! Given a credential and a 32-byte salt, a CTAP2 authenticator supporting the
+//! `hmac-secret` extension returns `HMAC-SHA256(credRandom, salt)`: 32 bytes that
+//! are deterministic, gated behind a physical touch, and derived from a secret that
+//! never leaves the device. This crate is the thin layer that asks for them.
+//!
+//! It is useful on its own — nothing here knows about vaults — and is published as
+//! a separate crate for that reason.
+//!
+//! # The hardware seam
+//!
+//! Every CTAP2/HID interaction sits behind the [`Authenticator`] trait, so
+//! consumers (including this crate's own tests) never depend on a physical device.
+//!
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! # fn main() -> Result<(), fido_token::TokenError> {
+//! // Create a credential. Blocks until someone touches the key.
+//! let credential = fido_token::register(&fido_token::RegisterOptions {
+//!     rp_id: "example.local".to_string(),
+//!     user_name: "example".to_string(),
+//!     require_uv: false,
+//!     timeout: Duration::from_secs(30),
+//!     pin_provider: fido_token::terminal_pin_provider(),
+//! })?;
+//!
+//! // Ask that credential for 32 bytes. Same credential and salt, same bytes,
+//! // every time -- which is the property everything else relies on.
+//! let salt = [0u8; 32];
+//! let secret = fido_token::derive_secret(
+//!     &credential,
+//!     &salt,
+//!     &fido_token::DeriveOptions {
+//!         require_uv: false,
+//!         timeout: Duration::from_secs(30),
+//!         pin_provider: fido_token::terminal_pin_provider(),
+//!     },
+//! )?;
+//! assert_eq!(secret.len(), 32);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Credentials are **non-resident**: the caller stores the [`Credential`] and passes
+//! it back on every assertion, so many vaults can share one physical key without
+//! exhausting its limited on-device credential slots. A `Credential` contains
+//! nothing secret.
 //!
 //! # Backends
 //!
 //! - [`HidAuthenticator`] is the real one, built on Mozilla's `authenticator`
-//!   crate. It is compiled only when the `hardware` feature is on (the default).
-//! - [`fake::FakeAuthenticator`] is a pure-software stand-in for tests, behind the
-//!   `test-util` feature.
+//!   crate. It is compiled only when the `hardware` feature is on (the default),
+//!   which is what lets dependent crates build and test on a machine that cannot
+//!   satisfy the platform HID build dependencies. With it off, every device call
+//!   returns [`TokenError::BackendUnavailable`].
+//! - `fake::FakeAuthenticator` is a pure-software stand-in for tests, behind the
+//!   `test-util` feature. It reproduces the real `hmac-secret` construction locally,
+//!   and can be told to fail in specific ways to exercise error paths.
+//!
+//! [`enumerate::list_devices`] is *not* gated: it is this crate's own code and is
+//! deliberately passive — no touch, no device opened for I/O — so it works where
+//! device interaction does not, which on Windows means unprivileged.
+//!
+//! # Platform notes
+//!
+//! Both platforms use raw USB HID; there is no `webauthn.dll` path. Since Windows 10
+//! 1903 a filter driver denies non-elevated processes read/write access to FIDO HID
+//! devices, so **on Windows everything except `list_devices` needs an elevated
+//! process**. On Linux, `/dev/hidraw*` is root-only by default and normally wants a
+//! udev rule. See `docs/fido-token.md`.
 //!
 //! # Logging
 //!
@@ -19,6 +78,10 @@
 //! the CTAP2 exchange. Key material is never logged: derived secrets appear only as
 //! a non-invertible [`fingerprint`], which is enough to check that two derivations
 //! agree without putting the secret itself in a log file.
+//!
+//! # Design notes
+//!
+//! `plan/01-crate-fido-token.md`.
 
 mod error;
 mod hid;
@@ -159,7 +222,7 @@ impl fmt::Debug for DeriveOptions {
 }
 
 /// The hardware seam. Real CTAP2 calls live in [`HidAuthenticator`]; tests (in this
-/// crate and downstream) use [`fake::FakeAuthenticator`] instead.
+/// crate and downstream) use `fake::FakeAuthenticator` instead.
 pub trait Authenticator {
     fn list_devices(&self) -> Result<Vec<DeviceInfo>, TokenError>;
 
