@@ -58,15 +58,70 @@ needed at this layer, just raw bytes:
   cleanly (this is the local stand-in for "touched the wrong security key").
 - **Format version guard**: a header claiming a future/unknown `format_version` is
   rejected on `open`, not partially parsed.
-- **Crash-safety**: simulate an interrupted write (e.g. by asserting the temp file
-  exists pre-rename in a controlled test hook, or simply asserting the original vault
-  file is untouched if `seal_*` is made to fail partway via an injected I/O error) —
-  exact mechanism TBD once the write path is implemented, but "original vault survives
-  a failed write" is a required test, not optional.
+- **Crash-safety**: the original vault survives a failed write. Implemented by
+  pointing `seal_*` at input that cannot be read and asserting the file on disk is
+  byte-identical afterwards, plus a check that no temp file is left behind — the
+  "exact mechanism TBD" this line used to carry.
+- **Keyfile factors** (M8): derivation is deterministic and changes when any of
+  keyfile, password, salt or Argon2 parameters changes; a mixed vault opens by
+  either route; wrong keyfile and wrong password fail *identically*, per the
+  no-fingerprint decision; out-of-range KDF parameters are rejected at parse time
+  before allocating; a v1 vault opens and is rewritten as v2 with the same data key.
 - **Property tests** (`proptest`) for the KV and dir round trips over randomized
   small inputs (random byte strings, random small directory trees) to catch edge
   cases fixed example tests miss (empty values, names with unusual characters,
   duplicate/near-duplicate paths).
+
+## Session tests (hardware-free)
+
+M9-M11 added state that outlives a single command, and the seam that keeps it
+testable is the same one `Vault` uses: a `Store` is handed an **already-derived data
+key**, so nothing below the REPL needs a security key.
+
+- **Session state** (`session.rs`): aliases from file stems with `-2` on collision,
+  resolution by alias or path, close and close-all ordering, and re-opening the same
+  vault reporting "already open" rather than a lock conflict with itself.
+- **Idle timeout** against an **injectable clock**, so expiry is asserted rather than
+  slept through: an idle store expires and a busy one does not, the warning fires
+  before the expiry and does not itself close anything, `--idle-timeout 0` never
+  expires, and expiry seals before dropping the key.
+- **Working directories** (`workdir.rs`): an untouched tree is not pending; edits,
+  additions, deletions and permission changes each are; a `--work-dir` the user
+  supplied is emptied but not removed; a failed seal keeps its plaintext.
+- **Locking** (`lock.rs`): acquire/release, a held lock excludes writers *and*
+  readers, a process never excludes itself, an unparseable lock file still excludes,
+  a provably dead holder is cleared automatically, and a holder on another host never
+  is.
+- **Orphan recovery** (`orphan.rs`): a dead session's working directory is offered, a
+  live one's is not, one on another host is not, resolving one store leaves the
+  others, and "leave it" is repeatable.
+- **Hardening** (`hardening.rs`): each key gets its own page, `Debug` never prints
+  key bytes, locks are released on drop so `RLIMIT_MEMLOCK` is not exhausted, and —
+  on Linux — the kernel is asked to confirm it, via `VmLck` in `/proc/self/status`.
+  Plus the interaction that could quietly destroy data: a process that has suppressed
+  its core dumps must still look *alive* to the liveness check that vault locks and
+  orphan records depend on.
+
+### End-to-end session tests (`tests/interactive.rs`)
+
+The keyfile factor from M8 is what makes these possible in CI: a whole session can be
+driven with no security key at all. They spawn the real binary with a scripted stdin
+and their own `XDG_RUNTIME_DIR`, and cover what unit tests structurally cannot — that
+a typed line becomes the right `Vault` call:
+
+- one unlock serving many commands, with no second password prompt;
+- a session's writes readable afterwards by a separate one-shot process;
+- a file and a dir store extracted, edited on disk, and sealed back, with an
+  unchanged store leaving the vault byte-identical;
+- a one-shot writer *and* reader both refused while a vault is held, and both working
+  once it is released;
+- a session killed outright, then its orphan offered and discarded by the next one;
+- `--work-dir` refusing a non-empty directory without touching what is in it;
+- a typo not ending the session;
+- on Linux, the kernel reporting locked memory in a running session.
+
+`tests/cli.rs` does the same for the one-shot commands that need no key — `info`
+being the only touch-free command, and `init` refusing to overwrite.
 
 ## Hardware-in-the-loop tests (manual, not CI)
 
@@ -97,8 +152,28 @@ requirement). The Windows run is done; the Linux run is outstanding.
   feature and with it the platform HID stack. This guards the promise that the
   hardware-free tests really are hardware-free: they must build and pass on a machine
   that cannot compile the real backend at all.
-- `cargo clippy --workspace -- -D warnings` and `cargo fmt --check`.
+- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check`.
+- `cargo audit` as its own job. It fails on a vulnerability; unmaintained-crate
+  warnings do not fail the build (there is one, `serde_cbor`, reached only via
+  `authenticator` — see [06-roadmap.md](06-roadmap.md) M6).
 - Hardware-in-the-loop tests are a manual pre-release checklist item, not a CI gate.
   The M1 procedure is written up in
   [../docs/M1-MANUAL-TESTING.md](../docs/M1-MANUAL-TESTING.md); `fido-token selftest`
   packages its acceptance check as one command.
+
+Worth doing locally before pushing anything with platform code in it:
+`cargo clippy --all-targets --target x86_64-pc-windows-msvc -- -D warnings`. The
+Windows half of the matrix is otherwise the first thing to find out that a
+`#[cfg]`-gated helper is now dead code there, or that a platform call does not
+compile — which is exactly what it caught for M11's `VirtualLock` work.
+
+## What still needs a physical key
+
+Every milestone from M1 on carries unchecked manual-validation boxes in
+[06-roadmap.md](06-roadmap.md); that is the list, kept per milestone rather than
+duplicated here so the two cannot drift. The shape of it: **Linux hardware validation
+has never been run at all** (M1's remaining item), the Windows run passed except for
+needing elevation, and everything from M2 on — vault round trips, directory symlink
+handling with and without Developer Mode, two-key enroll/revoke, a mixed
+security-key-and-keyfile vault, one touch per session `open`, and `VirtualLock` on
+Windows — is still outstanding.

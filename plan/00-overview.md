@@ -56,11 +56,27 @@ fidostorers/                         workspace root
 │   │       └── bin/fido-token.rs
 │   └── fidostorers/                 crate 2: encryption product (lib + CLI)
 │       ├── Cargo.toml
-│       └── src/
-│           ├── lib.rs
-│           ├── vault.rs             header format + crypto pipeline
-│           ├── error.rs             `VaultError`
-│           └── bin/fidostorers.rs
+│       ├── src/
+│       │   ├── lib.rs
+│       │   ├── vault.rs             header format + open/seal pipeline
+│       │   ├── crypto.rs            HKDF, AEAD, header MAC
+│       │   ├── keyfile.rs           Argon2id keyfile+password factor (M8)
+│       │   ├── archive.rs           tar build/extract for dir mode (M3)
+│       │   ├── kv.rs                the kv payload map (M4)
+│       │   ├── session.rs           open stores, aliases, idle timeout (M9)
+│       │   ├── lock.rs              advisory `<vault>.lock` (M9)
+│       │   ├── workdir.rs           plaintext working directories (M10)
+│       │   ├── orphan.rs            crash recovery for working dirs (M10)
+│       │   ├── hardening.rs         mlock'd keys, core-dump suppression (M11)
+│       │   ├── error.rs             `VaultError`
+│       │   └── bin/fidostorers/
+│       │       ├── main.rs          one-shot commands
+│       │       ├── repl.rs          `fidostorers interactive` (M9/M10)
+│       │       └── tokenize.rs      REPL line splitting
+│       └── tests/
+│           ├── cli.rs               one-shot CLI, end to end
+│           ├── interactive.rs       whole sessions, end to end (M9-M11)
+│           └── properties.rs        proptest round trips
 ├── docs/                            user- and developer-facing documentation
 └── plan/                            this planning material
 ```
@@ -95,6 +111,12 @@ A CLI (and thin library) that depends on `fido-token` and implements:
 - **File mode**: encrypt/decrypt a single file.
 - **Directory mode**: archive a directory tree, then encrypt/decrypt as one blob.
 - **KV mode**: a small encrypted key/value store (one vault file, many named secrets).
+- **Sessions**: `fidostorers interactive` holds an unlocked vault's data key so one
+  touch covers many commands, extracting `file`/`dir` stores to a plaintext working
+  directory for the life of the session. This is a deliberate reversal of the
+  one-touch-per-command default; see
+  [08-interactive-mode.md](08-interactive-mode.md) and
+  [04-security-and-threat-model.md](04-security-and-threat-model.md).
 
 See [02-crate-fidostorers.md](02-crate-fidostorers.md) and
 [03-vault-format-and-crypto.md](03-vault-format-and-crypto.md).
@@ -109,12 +131,18 @@ See [02-crate-fidostorers.md](02-crate-fidostorers.md) and
 | Serialization | `postcard` over `serde`-derived structs for vault headers | Compact and deterministic without hand-rolling an encoder. Encoder-version stability is an ordinary compatibility concern here rather than a security property, because `header_mac` is computed over the literal bytes written to disk and verified over the literal bytes read back. Requires parse-time bounds on every length prefix, since the header is read before it can be authenticated. |
 | Archiving | `tar` crate over the AEAD stream | Simple, well-understood, streams well; avoids reinventing an archive format. |
 | Secret hygiene | `zeroize` crate on all key material structs | Best-effort defense in depth; see [04-security-and-threat-model.md](04-security-and-threat-model.md). |
-| PIN entry | `rpassword` (CLI); optional callback in the library API | No-echo prompt, never persisted. The callback is `Option<...>` because on Windows the OS renders its own PIN dialog and it never fires — see [07-open-decisions.md](07-open-decisions.md) #9. |
+| PIN entry | `rpassword` (CLI); optional callback in the library API | No-echo prompt, never persisted. `Option<...>` so that `None` means "refuse rather than prompt", which is what `--no-pin` and non-interactive stdin need. **Correction (M1):** the original rationale here was that the callback never fires on Windows because the OS renders its own dialog. It does fire — that followed from the `webauthn.dll` assumption corrected above — and hardware test 6 confirms our own prompt is what appears. See [07-open-decisions.md](07-open-decisions.md) #9. |
 | CLI parsing | `clap` (derive API) | De facto standard, good help/UX, works identically for both crates' binaries. |
 | Errors | `thiserror` (library crates), `anyhow` (CLI binaries) | Standard split: typed errors in libraries, ergonomic bubbling in binaries. |
+| Password KDF | Argon2id (`argon2` crate) | The keyfile+password factor is the only one an attacker can grind offline, so it needs a memory-hard KDF. RustCrypto, matching the rest. See [10-keyfile-password-auth.md](10-keyfile-password-auth.md). |
+| REPL line editing | `rustyline`, **default features off** | For `fidostorers interactive`. Turning the default features off is load-bearing rather than a size choice: it drops `with-file-history`, which makes `DefaultHistory` an in-memory type with no way to reach disk, so `kv set --value <secret>` cannot be persisted. [07-open-decisions.md](07-open-decisions.md) #24. |
+| Signals | `signal-hook` (unix only) | `SIGTERM`/`SIGHUP` must run the same graceful shutdown as `exit`, and `SIGINT` must cancel rather than kill a session. std exposes no way to catch them. Windows has no equivalent, so it has none of this. |
+| Memory pinning, dumps | `libc` (unix), `winapi` (Windows) | `mlock`/`VirtualLock` for a session's data keys, plus `prctl(PR_SET_DUMPABLE)` and `setrlimit(RLIMIT_CORE)` on Linux. See M11 in [06-roadmap.md](06-roadmap.md). |
+| Lock/session records | `serde_json` | Human-readable state a user may have to read or delete by hand — a `<vault>.lock` naming its holder, and the session records orphan recovery reads. Deliberately not `postcard`: nothing here is a hot path, and being able to `cat` the file is the point. |
 
-All of these are confirmed in [07-open-decisions.md](07-open-decisions.md), which
-records the decisions and their rationale. The CTAP transport (#1) was reopened by an
+The reasoning behind most of these is recorded in
+[07-open-decisions.md](07-open-decisions.md) — #1-#10 for the original set, #21-#37
+for the session-era additions. The CTAP transport (#1) was reopened by an
 M1 finding — the Windows path is raw HID, not the OS WebAuthn API — and is now settled
 with a known limitation: **on Windows the tool must run elevated.** That is accepted
 for now, and the `webauthn.dll` backend that would lift it is tabled as phase-2 work.
@@ -128,6 +156,11 @@ for now, and the `webauthn.dll` backend that would lift it is tabled as phase-2 
 5. [05-testing-strategy.md](05-testing-strategy.md) — unit tests, mock authenticator, hardware-in-the-loop tests
 6. [06-roadmap.md](06-roadmap.md) — phased milestones
 7. [07-open-decisions.md](07-open-decisions.md) — decision record: what was settled, and why
-8. [08-interactive-mode.md](08-interactive-mode.md) — long-lived sessions with cached keys (planned)
-9. [09-credential-encoding.md](09-credential-encoding.md) — hex credential IDs in CLI JSON (planned)
-10. [10-keyfile-password-auth.md](10-keyfile-password-auth.md) — keyfile + password as a second factor (planned)
+8. [08-interactive-mode.md](08-interactive-mode.md) — long-lived sessions with cached keys (implemented, M9-M11)
+9. [09-credential-encoding.md](09-credential-encoding.md) — hex credential IDs in CLI JSON (implemented, M7)
+10. [10-keyfile-password-auth.md](10-keyfile-password-auth.md) — keyfile + password as a second factor (implemented, M8)
+
+Documents 1-5 describe the design as it stands; 8-10 were written as proposals and
+carry a status note at the top saying what shipped and what changed. The decision
+record (7) is the place to look for *why* something is the way it is, and the roadmap
+(6) for what each milestone actually did.

@@ -10,6 +10,14 @@ Everything in [plan/03-vault-format-and-crypto.md](../plan/03-vault-format-and-c
 assumes yes. This document is how you check. **Windows: answered yes, but only from an
 elevated terminal. Linux: not yet run.** See [Results so far](#results-so-far).
 
+**Scope: M1 only.** This is the `fido-token` acceptance procedure, not the whole
+project's manual test plan. Every milestone from M2 on carries its own unchecked
+hardware-validation boxes in [plan/06-roadmap.md](../plan/06-roadmap.md) — vault
+round trips, directory symlinks with and without Windows Developer Mode, two-key
+enroll and revoke, a mixed security-key-and-keyfile vault, one touch per session
+`open`, and `VirtualLock` on Windows. They are kept there, beside the work that
+introduced them, rather than duplicated into a second checklist that would drift.
+
 Unit tests cannot answer it — that is structural, not laziness. The whole point of
 the `Authenticator` trait seam is that everything *except* this question is testable
 without hardware, so the part that needs a human with a key in hand is as small as

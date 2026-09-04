@@ -4,7 +4,7 @@ A long-lived session that keeps a vault's data key in memory, so a user working 
 one or more vaults touches their security key once per vault rather than once per
 command.
 
-> **Status: implemented (M9 and M10).** Everything below describes what the tool
+> **Status: implemented (M9-M11).** Everything below describes what the tool
 > does, with these differences:
 >
 > - **Dirty tracking** is a digest of the bytes a seal would write, not the sketched
@@ -19,6 +19,9 @@ command.
 >   (`$XDG_RUNTIME_DIR`) is already a tmpfs.
 > - **Ctrl+C cancellation** is narrower than the table below implies; see
 >   [06-roadmap.md](06-roadmap.md) M9.
+> - **The hardening this document asks for at the end has landed** (M11): data keys
+>   are pinned and core dumps suppressed, and a session prints whether each is
+>   actually in force.
 >
 > Full accounting in [06-roadmap.md](06-roadmap.md) M9/M10 and
 > [07-open-decisions.md](07-open-decisions.md) #21–#32.

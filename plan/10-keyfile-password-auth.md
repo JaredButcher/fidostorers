@@ -1,5 +1,19 @@
 # Keyfile + password authentication
 
+> **Status: implemented (M8).** The design below is what shipped. Four things it did
+> not anticipate, all recorded in [06-roadmap.md](06-roadmap.md) M8: `Enrollment`
+> carries an explicit `rp_id` (a keyfile factor has no relying party to infer one
+> from); `enroll`/`revoke` use `--unlock-*` flags for the factor doing the unlocking,
+> since one `--keyfile` cannot name two different things; `enroll --password-stdin`
+> reads the *new* factor's password, with `--unlock-password-stdin` for the other;
+> and duplicate detection applies only to FIDO2 factors, because two keyfile factors
+> over the same file and password are legitimate and indistinguishable from the
+> header anyway.
+>
+> One item is still outstanding: a manual check that a **mixed** vault opens by
+> either route needs hardware. The hardware-free half of it —
+> `a_vault_can_hold_both_factor_kinds_and_either_unlocks_it` — is covered.
+
 A second way to unlock a vault, enrolled and revoked exactly like a security key: the
 user supplies **both** an arbitrary file and a password, and the two together with a
 per-entry salt derive that entry's KEK.

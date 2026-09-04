@@ -1,5 +1,9 @@
 # Credential JSON encoding
 
+> **Status: implemented (M7), as specified.** `fido-token` writes the hex form and
+> reads either form; the vault header is untouched, guarded by a test asserting a
+> header written before and after the change is byte-identical. No deviations.
+
 `fido-token register` prints a credential as JSON for the caller to store. Today
 `credential_id` comes out as an array of decimal bytes:
 

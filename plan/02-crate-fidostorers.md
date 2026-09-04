@@ -103,14 +103,21 @@ needed for v1. Noted as a deliberate simplicity-over-scalability choice.
 
 ## Library surface
 
-Crate 2 also exposes a thin library (`fidostorers::vault`) so the CLI is a thin
-wrapper and so future GUI/other frontends aren't required to shell out. As
-implemented in M2 — the original sketch differed in two ways, noted below:
+Crate 2 also exposes a library so the CLI is a thin wrapper and so future GUI/other
+frontends aren't required to shell out. What follows is the surface **as it stands**;
+the notes after it record where the original sketch did not survive contact.
 
 ```rust
-/// Everything needed to give one security key the ability to unlock a vault.
+/// How one enrolled entry produces its KEK.
+pub enum Factor {
+    Fido2(fido_token::Credential),
+    Keyfile(KeyfileParams),
+}
+
+/// Everything needed to give one factor the ability to unlock a vault.
 pub struct Enrollment {
-    pub credential: fido_token::Credential,
+    pub factor: Factor,
+    pub rp_id: String,
     pub label: String,
     pub salt: [u8; 32],
     pub kek: Zeroizing<[u8; 32]>,
@@ -125,61 +132,81 @@ pub struct Vault { /* opened header + the literal bytes header_mac covers + path
 impl Vault {
     pub fn create(path: &Path, mode: Mode, enrollment: &Enrollment) -> Result<Self, VaultError>;
     pub fn open(path: &Path) -> Result<Self, VaultError>; // header only, no touch, UNAUTHENTICATED
-    pub fn credentials(&self) -> &[CredentialEntry];
-    pub fn unlock_with(&self, credential_id: &[u8], kek: Zeroizing<[u8;32]>) -> Result<Zeroizing<[u8;32]>, VaultError>; // -> data key
-    pub fn enroll(&mut self, data_key: &Zeroizing<[u8;32]>, enrollment: &Enrollment) -> Result<(), VaultError>;
-    pub fn revoke(&mut self, data_key: &Zeroizing<[u8;32]>, credential_id: &[u8]) -> Result<(), VaultError>;
+    pub fn credentials(&self) -> &[FactorEntry];
+    pub fn unlock_with(&self, entry_id: &[u8], kek: Zeroizing<[u8; 32]>) -> Result<Zeroizing<[u8; 32]>, VaultError>;
+    pub fn enroll(&mut self, data_key: &[u8; 32], enrollment: &Enrollment) -> Result<(), VaultError>;
+    pub fn revoke(&mut self, data_key: &[u8; 32], entry_id: &[u8]) -> Result<(), VaultError>;
 
-    pub fn seal_file(&mut self, data_key: &Zeroizing<[u8;32]>, input: &Path) -> Result<(), VaultError>;
-    pub fn open_file(&self, data_key: &Zeroizing<[u8;32]>, output: &Path) -> Result<(), VaultError>;
-    pub fn seal_dir(&mut self, data_key: &Zeroizing<[u8;32]>, input_dir: &Path) -> Result<(), VaultError>;
-    pub fn open_dir(&self, data_key: &Zeroizing<[u8;32]>, output_dir: &Path) -> Result<(), VaultError>;
+    pub fn seal_file(&mut self, data_key: &[u8; 32], input: &Path) -> Result<(), VaultError>;
+    pub fn open_file(&self, data_key: &[u8; 32], output: &Path) -> Result<(), VaultError>;
+    pub fn seal_dir(&mut self, data_key: &[u8; 32], input_dir: &Path) -> Result<(), VaultError>;
+    pub fn open_dir(&self, data_key: &[u8; 32], output_dir: &Path) -> Result<ExtractReport, VaultError>;
 
-    pub fn kv_set(&mut self, data_key: &Zeroizing<[u8;32]>, name: &str, value: &[u8]) -> Result<(), VaultError>;
-    pub fn kv_get(&self, data_key: &Zeroizing<[u8;32]>, name: &str) -> Result<Zeroizing<Vec<u8>>, VaultError>;
-    pub fn kv_rm(&mut self, data_key: &Zeroizing<[u8;32]>, name: &str) -> Result<(), VaultError>;
-    pub fn kv_ls(&self, data_key: &Zeroizing<[u8;32]>) -> Result<Vec<String>, VaultError>;
+    pub fn kv_set(&mut self, data_key: &[u8; 32], name: &str, value: &[u8]) -> Result<(), VaultError>;
+    pub fn kv_get(&self, data_key: &[u8; 32], name: &str) -> Result<Zeroizing<Vec<u8>>, VaultError>;
+    pub fn kv_rm(&mut self, data_key: &[u8; 32], name: &str) -> Result<(), VaultError>;
+    pub fn kv_ls(&self, data_key: &[u8; 32]) -> Result<Vec<String>, VaultError>;
 }
 ```
 
-**`Enrollment` instead of a bare `(credential, kek)`.** The original sketch had no
-salt parameter, which cannot work: the KEK *is* `HKDF(hmac-secret(credential, salt))`,
-so the header must store the very salt it was derived from or the KEK can never be
-re-derived. Passing the three as one struct makes them impossible to separate at a
-call site.
+Sessions build on that without changing it — see
+[08-interactive-mode.md](08-interactive-mode.md):
+
+```rust
+/// One process, any number of open stores. Never talks to hardware: a `Store` is
+/// handed an already-derived data key, exactly as `Vault` is handed a derived KEK.
+pub struct Session { /* stores, injectable clock, idle timeout */ }
+pub struct Store   { /* alias, vault, pinned data key, optional working directory */ }
+
+/// 32 bytes in their own mlock'd page (M11).
+pub struct SecretKey;
+/// The advisory `<vault>.lock`: `acquire` for writers, `ensure_available` for readers.
+pub struct VaultLock;
+/// A store's extracted plaintext, and whether sealing it would change anything (M10).
+pub struct WorkDir;
+```
+
+### Where the original sketch was wrong
+
+**`Enrollment` instead of a bare `(credential, kek)`.** The M2 sketch had no salt
+parameter, which cannot work: the KEK *is* `HKDF(hmac-secret(credential, salt))`, so
+the header must store the very salt it was derived from or the KEK can never be
+re-derived. Passing them as one struct makes them impossible to separate at a call
+site. `rp_id` joined it in M8: a keyfile factor has no authenticator and therefore no
+relying party of its own, so the value cannot be inferred from the factor.
 
 **`seal_*` takes `&mut self`.** Sealing draws a fresh `payload_nonce` and sets
 `payload_len` — both header fields — so under the sketched `&self` the in-memory
 header would silently go stale against the file just written. A failed write rolls
 both fields back, so an ignored error cannot leave the two disagreeing either.
 
-`revoke` takes the data key because removing an entry changes the header, and the
-header's `header_mac` must be recomputed under a key derived from the data key (see
-[03-vault-format-and-crypto.md](03-vault-format-and-crypto.md)). The caller already
-holds it: revoking requires unlocking with a surviving credential first.
+**`open_dir` returns an `ExtractReport`, not `()`.** A partial extraction is a real
+outcome on Windows and the caller must be able to tell it from a complete one
+([07-open-decisions.md](07-open-decisions.md) #8).
 
-Note the split: `unlock_with` takes an already-derived KEK (crate 2 never imports
-`fido-token`'s HID internals into `Vault` itself — the CLI binary orchestrates "call
-fido-token to get the KEK, then call Vault with it"). This keeps `Vault`'s unit tests
-hardware-free by construction: tests just pass in an arbitrary 32-byte KEK, matching
-what `fido-token::derive_secret` would have produced.
+**`Factor`, not `Credential`, and `entry_id`, not `credential_id`.** A keyfile factor
+has no credential ID to be named by, so every entry gained a random 16-byte id in M8
+([10-keyfile-password-auth.md](10-keyfile-password-auth.md)).
+
+**The data key is a `&[u8; 32]`, not a wrapper.** A one-shot command holds it in a
+`Zeroizing`; a session holds it in a page-locked `SecretKey` (M11). The vault has no
+business caring which, the same way `unlock_with` does not care where its KEK came
+from.
+
+`revoke` takes the data key because removing an entry changes the header, and
+`header_mac` must be recomputed under a key derived from it. The caller already holds
+it: revoking requires unlocking with a surviving factor first.
+
+Note the split: `unlock_with` takes an already-derived KEK, so crate 2 never imports
+`fido-token`'s HID internals into `Vault` itself — the binary orchestrates "call
+fido-token to get the KEK, then call Vault with it". This keeps `Vault`'s unit tests
+hardware-free by construction, and it is what made a second factor type cheap in M8
+and a session cheap in M9: both are just other ways to produce 32 bytes.
 
 The HKDF step between the two lives in this crate as `kek_from_secret`, not in
 `fido-token` and not in the binary: the domain separator `"fidostorers-kek-v1"` is
 part of the *vault format*, so it belongs beside the format that defines it, while
 the binary stays a pure orchestrator that never picks a crypto parameter of its own.
-
-## Planned: a second factor type
-
-[10-keyfile-password-auth.md](10-keyfile-password-auth.md) adds keyfile+password
-authentication. The seam described just above is what makes it cheap: because
-`unlock_with` already takes an *already-derived* KEK and `Vault` never talks to
-hardware, a second factor is a second way to produce 32 bytes and nothing below the
-KEK changes.
-
-Two signature changes fall out, both in that document: `unlock_with(credential_id, ..)`
-becomes `unlock_with(entry_id, ..)`, since a keyfile factor has no credential ID; and
-`Enrollment` carries a `Factor` rather than a `fido_token::Credential`.
 
 ## Crash safety
 

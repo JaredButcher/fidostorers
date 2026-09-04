@@ -232,6 +232,12 @@ Everything else in the direct dependency set is current and actively maintained:
 `chacha20poly1305`, `hkdf`, `hmac`, `sha2` (RustCrypto), `postcard`, `tar`, `tempfile`,
 `zeroize`, `clap`, `anyhow`, `thiserror`, `rand`, `serde`, and `proptest` (dev-only).
 
+Added after this review, each justified where it was introduced and each clean in
+`cargo audit`: `argon2` (M8), `rustyline` and `signal-hook` (M9, see that milestone's
+"New dependencies"), `serde_json` (M9, for lock and session records), and `libc` /
+`winapi` (M11, for `mlock` and dump suppression). The `serde_cbor` finding above is
+still the only warning.
+
 ## M7 — Credential JSON hex encoding
 
 **Done.**
@@ -509,6 +515,13 @@ the Windows caveat below.
    Windows cannot suppress dumps at all. Both are probed and printed, because "we
    tried to lock memory" and "memory is locked" are different claims and only the
    second is worth making to a user deciding whether to trust a session.
+
+### New dependencies
+
+`libc` on unix (`mlock`, `munlock`, `sysconf`, `prctl`, `setrlimit`) and `winapi` on
+Windows (`VirtualLock`, `VirtualUnlock`, `GetSystemInfo`). Both are the standard
+binding crates for their platform, and `winapi` was already in the workspace as a
+build shim for `authenticator`; M11 only adds feature flags to it. No advisories.
 
 ### What is *not* hardened, deliberately
 

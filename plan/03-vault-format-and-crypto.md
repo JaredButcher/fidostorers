@@ -149,8 +149,17 @@ The format puts **one** AEAD tag over the whole payload, so sealing and opening 
 single-shot: the entire plaintext is in memory at once. That is a consequence of the
 format, not an implementation shortcut — a streaming variant would need per-chunk
 tags and a chunk framing, which is a different on-disk layout. Peak memory is
-therefore the payload size, which is fine for `file` and `kv` but is the thing to
-re-examine in M3, where a directory tree can be arbitrarily large.
+therefore the payload size, which is fine for `file` and `kv` but was flagged for
+review in M3, where a directory tree can be arbitrarily large.
+
+**Re-examined and kept.** M3 changed nothing here: streaming would mean a different
+format, and the milestone was not worth spending on a limit nobody had hit. M9/M10
+made it slightly more pointed — a session builds the whole archive in memory to
+decide whether sealing would change anything, then seals those same bytes — but the
+ceiling is unchanged, because the one-shot `lock` already held the entire tree in
+memory to encrypt it. So the practical limit on a `dir` vault is "a tree that fits in
+RAM", in a session exactly as outside one. A streaming payload remains the answer if
+that ever stops being acceptable, and it is a format change, not a patch.
 
 ## Payload encoding per mode
 

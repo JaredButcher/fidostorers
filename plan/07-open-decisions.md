@@ -3,6 +3,20 @@
 Things this plan made a reasonable default call on, now deliberately confirmed or
 overridden rather than left to ossify by momentum.
 
+Numbering is append-only and never reused, so a reference to "#22" from code or from
+another document keeps meaning the same decision. A decision that was later revised
+says so in place rather than being rewritten — #22 is the one that has been, and
+reading what it used to say is the point of keeping it.
+
+| Decisions | Settled during | Govern |
+|---|---|---|
+| #1-#10 | initial planning, revised by M1 | the transport, the format, the crate split |
+| #11-#14 | M1 | hardware backend gating, enumeration, logging |
+| #15-#20 | before M7-M11 were planned | interactive mode and the second factor |
+| #21-#26 | M9 | the session core |
+| #27-#32 | M10 | working directories |
+| #33-#37 | M11 | memory pinning and dump suppression |
+
 ## Decided
 
 | # | Decision | Outcome | Notes |
@@ -38,8 +52,10 @@ there before M1 closes. Nothing in the Windows result predicts a Linux problem �
 Linux gates the same access behind udev rules rather than a filter driver — but it is
 currently untested, so no claim is made about it.
 
-Nothing is open. #8 governs M3 and #5/#5b govern M2, both ahead of the milestones that
-need them; #15–#20 govern M7–M11.
+**Nothing is open.** Every decision above is either settled or explicitly deferred to
+phase 2 ([06-roadmap.md](06-roadmap.md)): the `webauthn.dll` backend (#1), the U2F
+fallback, resident credentials, NFC/BLE transports, a true `--rekey`, and Windows
+crash-dump exclusion (#37).
 
 ## New decisions from M1
 

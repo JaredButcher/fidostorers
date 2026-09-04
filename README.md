@@ -382,16 +382,28 @@ cargo fmt --all -- --check
 cargo audit
 ```
 
-`crates/fidostorers/tests/interactive.rs` drives a real session end to end using a
-keyfile factor, which is why it needs no security key.
+The second command drops the `hardware` feature and the whole platform HID stack, so
+the test suite builds and passes on a machine that cannot compile the real backend.
 
-The second form drops the `hardware` feature and the whole platform HID stack, so the
-test suite builds and passes on a machine that cannot compile the real backend. Tests
-never require a physical key: `Vault` takes an already-derived key-encryption key, and
-`fido-token` has an in-memory fake authenticator.
+**No test needs a physical key.** `Vault` takes an already-derived key-encryption
+key, a session takes an already-derived data key, and `fido-token` has an in-memory
+fake authenticator. `crates/fidostorers/tests/interactive.rs` drives whole sessions
+end to end through a keyfile factor, which involves no hardware at all.
+
+If you touch anything platform-specific, cross-check the other half of the CI matrix
+before pushing — it is otherwise the first thing to discover that a `#[cfg]`-gated
+helper is now dead code there:
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+cargo clippy --workspace --all-targets --features fido-token/test-util \
+      --target x86_64-pc-windows-msvc -- -D warnings
+```
 
 Hardware behaviour is verified manually — see
-[`docs/M1-MANUAL-TESTING.md`](docs/M1-MANUAL-TESTING.md).
+[`docs/M1-MANUAL-TESTING.md`](docs/M1-MANUAL-TESTING.md) for the procedure, and the
+unchecked boxes in [`plan/06-roadmap.md`](plan/06-roadmap.md) for what is still
+outstanding.
 
 ## License
 
